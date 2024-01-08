@@ -1,0 +1,2166 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloudformation for Chat Position In Queue Blog Post and Post-contact Surveys for Amazon Connect deployment (SO9273)
+
+Mappings:
+  CFTParameters:
+    S3Bucket:   
+      Name: aws-contact-center-blog
+    S3Prefix:
+      Value: amazon-connect-post-call-surveys
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Amazon Connect Resource Information"
+        Parameters:
+          - ConnectInstanceId
+          - BasicQueueArn
+          - SampleDisconnectFlowArn
+    ParameterLabels: 
+      ConnectInstanceId: 
+        default: "Amazon Connect Instance Id to be used"
+      BasicQueueArn: 
+        default: "ARN of the BasicQueue in your Amazon Connect Instance"
+      SampleDisconnectFlowArn: 
+        default: "ARN of the Sample Disconnect Flow in your Amazon Connect Instance"
+      
+      AmazonConnectInstanceARN:
+        default: "The Amazon Connect instance ARN"
+      AmazonConnectInstanceName:
+        default: "The Amazon Connect instance name"
+      ContactFlowIdForTasks:
+        default: "The contact flow you want generated tasks to be directed to"
+      AdminEmailAddress:
+        default: "The email address for the initial user of the solution"
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: Enter the Amazon Connect Instance Id
+  BasicQueueArn:
+    Type: String
+    Description: Enter the Amazon Connect Basic Queue Arn
+  SampleDisconnectFlowArn:
+    Type: String
+    Description: Enter the Amazon Connect Sample Disconnect Flow Arn
+  
+  AmazonConnectInstanceARN:
+    Type: String
+    Description: "The Amazon Connect instance ARN"
+  AmazonConnectInstanceName:
+    Type: String
+    Description: "The Amazon Connect instance name"
+  ContactFlowIdForTasks:
+    Type: String
+    Description: "The contact flow you want generated tasks to be directed to"
+  AdminEmailAddress:
+    Type: String
+    Description: "The email address for the initial user of the solution"
+
+
+Resources:
+  PositionInQueueDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+                  - ''
+                  - - !Ref AWS::StackName
+                    - '-ChatPositionInQueueDB'
+      AttributeDefinitions:
+        - AttributeName: ID
+          AttributeType: S
+      KeySchema: 
+        - AttributeName: ID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST       
+  
+  ChatPositionInQueueFnRole:
+    DependsOn: PositionInQueueDB
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+                  - ''
+                  - - !Ref AWS::StackName
+                    - '-ChatPositionInQueueFnRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17       
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DynamoDBManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Managed Policy to attach to ChatPositionInQueueFnRole 
+      ManagedPolicyName: !Join
+                          - ''
+                          - - !Ref AWS::StackName
+                            - '-DynamoDBAccessPolicyForLambda'
+      Path: /
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'dynamodb:BatchGetItem'
+              - 'dynamodb:BatchWriteItem'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:DeleteItem'
+              - 'dynamodb:Scan'
+              - 'dynamodb:Query'
+              - 'dynamodb:UpdateItem'  
+              - 'dynamodb:GetItem'   
+              - 'dynamodb:UpdateTable'
+            Resource: !GetAtt PositionInQueueDB.Arn
+      Roles: 
+        - !Ref ChatPositionInQueueFnRole        
+
+  ConnectManagerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Managed Policy to attach to ChatPositionInQueueFnRole 
+      ManagedPolicyName: !Join
+                          - ''
+                          - - !Ref AWS::StackName
+                            - '-ConnectAccessForLambda'
+      Path: /
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'connect:GetCurrentMetricData'
+              - 'connect:ListQueues'
+            Resource: !Join
+                      - ''
+                      - - 'arn:aws:connect:'
+                        - !Ref AWS::Region 
+                        - ':'
+                        - !Ref AWS::AccountId
+                        - ':instance/'
+                        - !Ref ConnectInstanceId
+                        - '/*'
+      Roles: 
+        - !Ref ChatPositionInQueueFnRole         
+
+  ChatPositionInQueueLambdaFunction:
+    DependsOn: ChatPositionInQueueFnRole
+    Type: AWS::Lambda::Function 
+    Properties:
+      FunctionName: !Join
+                    - ''
+                    - - !Ref AWS::StackName
+                      - '-ChatPositionInQueueLambda'
+      Description: Adds deletes and maintains customer contact id in DynamoDB
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Role: !GetAtt ChatPositionInQueueFnRole.Arn
+      MemorySize: 4096
+      Timeout: 60
+      Environment:
+        Variables:
+          CONNECTINSTANCEID: !Ref "ConnectInstanceId" 
+          POSINQUEUEDDB: !Ref PositionInQueueDB
+          WATCHDOGTHRESHOLD: "105000"
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const connect = new AWS.Connect();
+          const connectInstanceID = process.env.CONNECTINSTANCEID;
+          const posInQueueDDBTable = process.env.POSINQUEUEDDB;
+
+          exports.handler = async(event) => {
+              console.log('Event received:', JSON.stringify(event));
+              try {
+                  const operation = !event.Details?.Parameters.operation ?
+                      !event.Parameters?.operation ? 'invalid event' : event.Parameters.operation :
+                      event.Details.Parameters.operation;
+
+                  switch (operation) {
+                      case "add":
+                          const positionInQueue = await addRecord(event);
+                          console.log('Contact addition complete');
+                          return { positionInQueue: positionInQueue };
+                      case "delete":
+                          await deleteRecord(event);
+                          console.log('Contact deletion complete');
+                          return;
+                      case "maintain":
+                          const queueList = await getConnectQueueList(connectInstanceID);
+                          if (queueList.length === 0) {
+                              console.log('No Queue to process');
+                          }
+                          else {
+                              for (let i = 0; i < queueList.QueueSummaryList.length; i++) {
+                                  await maintainBaseContactID(queueList.QueueSummaryList[i].Name, queueList.QueueSummaryList[i].Arn);
+                              }
+                              await maintainPosInQRecords(event, queueList.QueueSummaryList);
+                          }
+                          console.log("End of Maintainence");
+                          return;
+                      default:
+                          throw new Error(`Invalid operation: ${operation}`);
+                  }
+
+              }
+              catch (err) {
+                  console.error(err);
+                  throw err;
+              }
+          };
+
+          async function addRecord(event) {
+              const contactId = event.Details.ContactData.ContactId;
+              const queueName = event.Details.ContactData.Queue.Name;
+
+              const getRecordForContactIdParams = {
+                  TableName: posInQueueDDBTable,
+                  KeyConditionExpression: "ID = :varContactId",
+                  ExpressionAttributeValues: {
+                      ":varContactId": { S: contactId }
+                  },
+              };
+
+              const dynamodb = new AWS.DynamoDB();
+              const getRecordForContactIdResult = await dynamodb.query(getRecordForContactIdParams).promise();
+
+              const currentTime = Math.floor(new Date()).toString();
+              let positionInQueue = null;
+              if (getRecordForContactIdResult.Items.length == 0) {
+                  /*Get total customers in queue since this customer will be added to the end
+                          Total customers is contained in base ID = Queue Name (Eg: BasicQueue) */
+
+                  console.log('ContactID does not exist, Adding it');
+
+                  const getRecordForBaseIDParams = {
+                      TableName: posInQueueDDBTable,
+                      KeyConditionExpression: "ID = :varContactId",
+                      ExpressionAttributeValues: {
+                          ":varContactId": { S: queueName.toString() }
+                      }
+                  };
+
+                  const getRecordForBaseIdResult = await dynamodb.query(getRecordForBaseIDParams).promise();
+                  if (getRecordForBaseIdResult.Items.length === 0) {
+                      throw new Error("No details for Base ID's found, please enable the cloudwatch event to run the maintain function first before adding any contact id's");
+                  }
+                  const totalCustomersInQueue = getRecordForBaseIdResult.Items[0].PositionInQueue.S;
+
+                  const dbInsertParams = {
+                      TableName: posInQueueDDBTable,
+                      Item: {
+                          'ID': { S: contactId },
+                          'TimePlacedInQueueEpoch': { S: currentTime.toString() },
+                          'PositionInQueue': { S: totalCustomersInQueue.toString() },
+                          'IDType': { S: 'ContactID' },
+                          'QueueName': { S: queueName.toString() },
+                          'WatchDogTime': { S: currentTime.toString() }
+                      },
+                  };
+
+                  console.log('Inserting into DDB: ', dbInsertParams);
+                  await dynamodb.putItem(dbInsertParams).promise();
+
+                  positionInQueue = totalCustomersInQueue;
+
+              }
+              else {
+                  console.log('ContactID does exist, updating it');
+
+                  // update the watchdog for the ContactID
+                  const updateWatchDogTimerParams = {
+                      TableName: posInQueueDDBTable,
+                      Key: {
+                          "ID": { S: contactId }
+                      },
+                      UpdateExpression: "set WatchDogTime = :updatedWatchDogTimer",
+                      ExpressionAttributeValues: {
+                          ":updatedWatchDogTimer": { S: currentTime }
+                      },
+                      ReturnValues: "UPDATED_NEW"
+                  };
+                  await dynamodb.updateItem(updateWatchDogTimerParams).promise();
+
+                  positionInQueue = getRecordForContactIdResult.Items[0].PositionInQueue.S;
+              }
+
+              return positionInQueue;
+          }
+
+          async function deleteRecord(event) {
+              const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+              var deleteParams = {
+                  TableName: posInQueueDDBTable,
+                  Key: {
+                      "ID": event.Details.ContactData.ContactId
+                  },
+              };
+              await dynamodb.delete(deleteParams).promise();
+          }
+
+          async function maintainBaseContactID(queueName, queueArn) {
+              // 0 is replaced by the Queue Name in ContactID to maintain the updated contact count in DB
+              const maintainQueueArn = queueArn;
+              const maintainQueueName = queueName;
+
+
+              const ddbQueryParams = {
+                  TableName: posInQueueDDBTable,
+                  KeyConditionExpression: "ID = :sContactId",
+                  ExpressionAttributeValues: {
+                      ":sContactId": { S: maintainQueueName } // Getting the Base Contact ID. Base Contact ID has the Queue Name instead of the value 0.
+                  },
+              };
+
+              const dynamodb = new AWS.DynamoDB();
+              const queryResult = await dynamodb.query(ddbQueryParams).promise();
+
+
+              const currentTime = Math.floor(new Date()).toString();
+              const contactsInQueue = await getContactsInQueue(maintainQueueArn, maintainQueueName);
+
+              const updateParams = {
+                  TableName: posInQueueDDBTable,
+                  Key: {
+                      "ID": { S: maintainQueueName },
+                  },
+                  UpdateExpression: "set PositionInQueue = :contactsInQueue, TimePlacedInQueueEpoch = :timePlaced, IDType = :type", //, QueueArn = :queueArn",
+                  ExpressionAttributeValues: {
+                      ":contactsInQueue": { S: contactsInQueue.toString() },
+                      ":timePlaced": { S: currentTime.toString() },
+                      ":type": { S: "Queue" }
+                      // ":queueArn": { S: maintainQueueArn.toString() }
+                  },
+                  ReturnValues: "UPDATED_NEW"
+              };
+              //Updating Base ContactID
+              await dynamodb.updateItem(updateParams).promise();
+          }
+
+          async function maintainPosInQRecords(event, queueList) {
+
+              const dynamodb = new AWS.DynamoDB();
+              let scannedDbItems = [];
+
+
+              const scanParams = {
+                  TableName: posInQueueDDBTable,
+              };
+
+              while (true) {
+                  const scanResult = await dynamodb.scan(scanParams).promise();
+                  scannedDbItems = scannedDbItems.concat(scanResult.Items);
+
+                  if (typeof scanResult.LastEvaluatedKey != "undefined") {
+                      scanParams.ExclusiveStartKey = scanResult.LastEvaluatedKey;
+                  }
+                  else {
+                      break;
+                  }
+              }
+
+              const positionInQueueMap = {};
+              const currentTime = Math.floor(new Date());
+              const watchdogThresholdMS = process.env.WATCHDOGTHRESHOLD;
+              const abandonedCallSet = new Array();
+
+              for (let i = 0; i < scannedDbItems.length; i++) {
+                  const idType = scannedDbItems[i].IDType.S;
+
+                  if (idType === 'ContactID') {
+                      const queue = scannedDbItems[i].QueueName.S;
+
+                      const watchdogElaspedTime = currentTime - scannedDbItems[i].WatchDogTime.S;
+
+                      if (watchdogElaspedTime > watchdogThresholdMS) {
+                          abandonedCallSet.push(scannedDbItems[i]);
+                      }
+                      else {
+                          if (queue in positionInQueueMap) {
+                              positionInQueueMap[queue].push(scannedDbItems[i]);
+                          }
+                          else {
+                              positionInQueueMap[queue] = [scannedDbItems[i]];
+                          }
+                      }
+                  }
+              }
+
+              for (const [key, value] of Object.entries(positionInQueueMap)) {
+                  value.sort(function(a, b) { return a.TimePlacedInQueueEpoch.S - b.TimePlacedInQueueEpoch.S });
+              }
+
+              for (const [key, value] of Object.entries(positionInQueueMap)) {
+                  for (let pos = 0; pos < value.length; pos++) {
+                      const scannedItem = value[pos];
+                      // console.log(`DDB update: ${key}, ${value[pos]}, ${pos}`);
+                      const updatePosParams = {
+                          TableName: posInQueueDDBTable,
+                          Key: {
+                              "ID": { S: scannedItem.ID.S.toString() }
+                          },
+                          UpdateExpression: "set PositionInQueue = :contactPosInQueue",
+                          ExpressionAttributeValues: {
+                              ":contactPosInQueue": { S: pos.toString() },
+                          },
+                          ReturnValues: "UPDATED_NEW"
+                      };
+
+                      await dynamodb.updateItem(updatePosParams).promise();
+                  }
+              }
+
+              if (abandonedCallSet.length > 0) {
+                  for (let i = 0; i < abandonedCallSet.length; i++) {
+                      const params = {
+                          TableName: posInQueueDDBTable,
+                          Key: {
+                              "ID": { S: abandonedCallSet[i].ID.S.toString() },
+                          },
+                      };
+                      await dynamodb.deleteItem(params).promise();
+                  }
+              }
+          }
+
+          async function getConnectQueueList(connectInstanceID) {
+
+              const params = {
+                  InstanceId: connectInstanceID,
+                  QueueTypes: ['STANDARD']
+              }
+
+              const queueList = await connect.listQueues(params).promise();
+              return queueList;
+          }
+
+          async function getContactsInQueue(queueArn, queueName) {
+              const currentMetricsParams = {
+                  CurrentMetrics: [ /* required */
+                      { Name: 'CONTACTS_IN_QUEUE', Unit: 'COUNT' },
+                  ],
+                  Filters: { /* required */
+                      Channels: ['CHAT'],
+                      Queues: [queueArn],
+                  },
+                  InstanceId: connectInstanceID,
+                  /* required */
+                  Groupings: ['QUEUE'],
+                  MaxResults: 1,
+                  NextToken: null,
+              };
+
+              let contactsInQueueCount = null;
+
+              const queueMetrics = await connect.getCurrentMetricData(currentMetricsParams).promise();
+              if (queueMetrics.MetricResults.length === 0) {
+                  contactsInQueueCount = '0';
+              }
+              else {
+                  contactsInQueueCount = queueMetrics.MetricResults[0].Collections.find(contactsInQueueCount => contactsInQueueCount.Metric.Name === 'CONTACTS_IN_QUEUE').Value;
+              }
+
+              return contactsInQueueCount.toString();
+          }
+
+  ChatPositionInQueueEventRule:
+    DependsOn: ChatPositionInQueueLambdaFunction
+    Type: "AWS::Events::Rule"
+    Properties:
+        Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueEventRule'
+        Description: "Position in Queue cloudwatch rule"
+        ScheduleExpression: "rate(1 minute)"
+        State: "ENABLED"
+        Targets: 
+          - 
+            Arn: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+            Id: "Id2889402329267"
+            Input: "{     \"Parameters\": {       \"operation\": \"maintain\"     } }"
+        EventBusName: "default"
+
+  EventsInvokeLambdaFnPermission: 
+    DependsOn: ChatPositionInQueueEventRule
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref ChatPositionInQueueLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ChatPositionInQueueEventRule.Arn
+
+  ConnectInvokeLambdaFnPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChatPositionInQueueLambdaFunction
+      Principal: connect.amazonaws.com
+      SourceArn: !Join
+                - ''
+                - - 'arn:aws:connect:'
+                  - !Ref AWS::Region 
+                  - ':'
+                  - !Ref AWS::AccountId
+                  - ':instance/'
+                  - !Ref ConnectInstanceId
+
+  PositionInQueueChatFlow:
+    DependsOn: 
+    - PositionInQueueCustomerQueueAddRecordFlow
+    - PositionInQueueCustomerWhisperRemoveRecordFlow
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueChat'
+      Description: Position In Queue Inbound Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"3dc68fd7-60dd-4318-b0f7-420931062b05\",\"Metadata\":{\"entryPointPosition\":{\"x\":20,\"y\":20},\"ActionMetadata\":{\"3dc68fd7-60dd-4318-b0f7-420931062b05\":{\"position\":{\"x\":164,\"y\":20}},\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\":{\"position\":{\"x\":406.40000000000003,\"y\":285.6}},\"2db78269-2720-41b1-8928-5a5684d7788f\":{\"position\":{\"x\":154.4,\"y\":247.20000000000002}},\"58ae6259-87a7-41fd-84ed-4c524847cbcc\":{\"position\":{\"x\":1250.4,\"y\":14.4},\"parameters\":{\"QueueId\":{\"displayName\":\"BasicQueue\"}},\"queue\":{\"text\":\"BasicQueue\"}},\"890318c8-591c-4175-b93e-7abc17cba9de\":{\"position\":{\"x\":382.40000000000003,\"y\":20.8},\"overrideConsoleVoice\":false},\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\":{\"position\":{\"x\":1032.8,\"y\":14.4},\"parameters\":{\"EventHooks\":{\"CustomerWhisper\":{\"displayName\":\"PositionInQueueCustomerWhisperRemoveRecordFlowName\"}}},\"contactFlow\":{\"text\":\"PositionInQueueCustomerWhisperRemoveRecord\",\"id\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"},\"customerOrAgent\":true},\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\":{\"position\":{\"x\":1478.4,\"y\":-66.4}},\"95df56f1-b9c3-484d-9d26-6751a3059780\":{\"position\":{\"x\":602.4,\"y\":20},\"parameters\":{\"EventHooks\":{\"CustomerRemaining\":{\"displayName\":\"Sample disconnect flow\"}}},\"contactFlow\":{\"text\":\"Sample disconnect flow\",\"id\":\"${SampleDisconnectFlowArn}\"}},\"1c63f47a-f21b-4760-aaef-50e61da90f52\":{\"position\":{\"x\":820.8000000000001,\"y\":18.400000000000002},\"parameters\":{\"EventHooks\":{\"CustomerQueue\":{\"displayName\":\"PositionInQueueCustomerQueueAddRecord\"}}},\"contactFlow\":{\"text\":\"PositionInQueueCustomerQueueAddRecord\",\"id\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"},\"customerOrAgent\":true}}},\"Actions\":[{\"Parameters\":{\"FlowLoggingBehavior\":\"Enabled\"},\"Identifier\":\"3dc68fd7-60dd-4318-b0f7-420931062b05\",\"Type\":\"UpdateFlowLoggingBehavior\",\"Transitions\":{\"NextAction\":\"890318c8-591c-4175-b93e-7abc17cba9de\"}},{\"Parameters\":{},\"Identifier\":\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\",\"Type\":\"TransferContactToQueue\",\"Transitions\":{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"QueueAtCapacity\"},{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"Hi, Welcome to Chat Position In Queue Blog.\"},\"Identifier\":\"2db78269-2720-41b1-8928-5a5684d7788f\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"QueueId\":\"${BasicQueueArn}\"},\"Identifier\":\"58ae6259-87a7-41fd-84ed-4c524847cbcc\",\"Type\":\"UpdateContactTargetQueue\",\"Transitions\":{\"NextAction\":\"2db78269-2720-41b1-8928-5a5684d7788f\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"TextToSpeechVoice\":\"Joanna\"},\"Identifier\":\"890318c8-591c-4175-b93e-7abc17cba9de\",\"Type\":\"UpdateContactTextToSpeechVoice\",\"Transitions\":{\"NextAction\":\"95df56f1-b9c3-484d-9d26-6751a3059780\"}},{\"Parameters\":{\"EventHooks\":{\"CustomerWhisper\":\"${PositionInQueueCustomerWhisperRemoveRecordFlow}\"}},\"Identifier\":\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"58ae6259-87a7-41fd-84ed-4c524847cbcc\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{},\"Identifier\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"Type\":\"DisconnectParticipant\",\"Transitions\":{}},{\"Parameters\":{\"EventHooks\":{\"CustomerRemaining\":\"${SampleDisconnectFlowArn}\"}},\"Identifier\":\"95df56f1-b9c3-484d-9d26-6751a3059780\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"1c63f47a-f21b-4760-aaef-50e61da90f52\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"EventHooks\":{\"CustomerQueue\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"}},\"Identifier\":\"1c63f47a-f21b-4760-aaef-50e61da90f52\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - PositionInQueueCustomerQueueAddRecordFlow: !GetAtt PositionInQueueCustomerQueueAddRecordFlow.ContactFlowArn
+          PositionInQueueCustomerWhisperRemoveRecordFlow: !GetAtt PositionInQueueCustomerWhisperRemoveRecordFlow.ContactFlowArn
+          BasicQueueArn: !Ref BasicQueueArn
+          SampleDisconnectFlowArn: !Ref SampleDisconnectFlowArn
+
+      State: ACTIVE
+      Type: CONTACT_FLOW
+
+  PositionInQueueCustomerQueueAddRecordFlow:
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueCustomerQueueAddRecord'
+      Description: Position In Queue Customer Queue Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\",\"Metadata\":{\"entryPointPosition\":{\"x\":-67.2,\"y\":54.400000000000006},\"ActionMetadata\":{\"438a9be3-850b-4a4d-b90b-6c3499683fce\":{\"position\":{\"x\":1040.8,\"y\":91.2},\"conditionMetadata\":[{\"id\":\"619a8a5a-1a9d-4284-9daa-daa617056665\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"0\"},{\"id\":\"bfd3ffec-16ec-49c9-af6a-59fc0a1a91d0\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"1\"}]},\"01cf08c9-5293-448d-b74b-987a9db1fa3d\":{\"position\":{\"x\":789.6,\"y\":89.60000000000001},\"dynamicParams\":[]},\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\":{\"position\":{\"x\":1288,\"y\":89.60000000000001}},\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\":{\"position\":{\"x\":1295.2,\"y\":281.6}},\"4e39f4f5-072d-49a3-859c-a456ea518560\":{\"position\":{\"x\":1295.2,\"y\":478.40000000000003}},\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\":{\"position\":{\"x\":798.4000000000001,\"y\":-96},\"dynamicParams\":[]},\"ceefc394-319b-49e0-bdec-da0007a0d20c\":{\"position\":{\"x\":1289.6000000000001,\"y\":-106.4}},\"f542437b-05eb-45c5-bf64-1612688ef82c\":{\"position\":{\"x\":552,\"y\":-20},\"conditionMetadata\":[{\"id\":\"ff29df42-66c7-4595-aa93-9326ba565a87\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"True\"}]},\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\":{\"position\":{\"x\":60,\"y\":36.800000000000004},\"dynamicParams\":[]},\"ed12a7df-a29a-44f4-8d86-b0721848d663\":{\"position\":{\"x\":1558.4,\"y\":35.2},\"parameters\":{\"TimeLimitSeconds\":{\"unit\":1}},\"timeoutUnit\":{\"display\":\"Seconds\",\"value\":\"second\"}},\"68c64852-a34f-444a-82f2-de2c58d50e1b\":{\"position\":{\"x\":1804,\"y\":-212}},\"51463702-9093-4037-8dd8-3ce3ab54da5e\":{\"position\":{\"x\":312,\"y\":-8},\"parameters\":{\"LambdaFunctionARN\":{\"displayName\":\"${LambdaFunctionDisplayname}\"}},\"dynamicMetadata\":{\"operation\":false}}}},\"Actions\":[{\"Parameters\":{\"ComparisonValue\":\"$.Attributes.customerPosition\"},\"Identifier\":\"438a9be3-850b-4a4d-b90b-6c3499683fce\",\"Type\":\"Compare\",\"Transitions\":{\"NextAction\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"Conditions\":[{\"NextAction\":\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"0\"]}},{\"NextAction\":\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"1\"]}}],\"Errors\":[{\"NextAction\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"ErrorType\":\"NoMatchingCondition\"}]}},{\"Parameters\":{\"Attributes\":{\"customerPosition\":\"$.External.positionInQueue \"}},\"Identifier\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"438a9be3-850b-4a4d-b90b-6c3499683fce\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are next\"},\"Identifier\":\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are behind 1 customer in the queue\"},\"Identifier\":\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are behind $.Attributes.customerPosition customers in the queue\"},\"Identifier\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Attributes\":{\"firstTime\":\"False\"}},\"Identifier\":\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"ceefc394-319b-49e0-bdec-da0007a0d20c\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You've been added to the queue\"},\"Identifier\":\"ceefc394-319b-49e0-bdec-da0007a0d20c\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"ComparisonValue\":\"$.Attributes.firstTime\"},\"Identifier\":\"f542437b-05eb-45c5-bf64-1612688ef82c\",\"Type\":\"Compare\",\"Transitions\":{\"NextAction\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"Conditions\":[{\"NextAction\":\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"True\"]}}],\"Errors\":[{\"NextAction\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"ErrorType\":\"NoMatchingCondition\"}]}},{\"Parameters\":{\"Attributes\":{\"firstTime\":\"True\"}},\"Identifier\":\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"TimeLimitSeconds\":\"70\"},\"Identifier\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Type\":\"Wait\",\"Transitions\":{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"Conditions\":[{\"NextAction\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"WaitCompleted\"]}}],\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{},\"Identifier\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"Type\":\"DisconnectParticipant\",\"Transitions\":{}},{\"Parameters\":{\"LambdaFunctionARN\":\"${ChatPositionInQueueLambdaFunction}\",\"InvocationTimeLimitSeconds\":\"3\",\"LambdaInvocationAttributes\":{\"operation\":\"add\"}},\"Identifier\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Type\":\"InvokeLambdaFunction\",\"Transitions\":{\"NextAction\":\"f542437b-05eb-45c5-bf64-1612688ef82c\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - ChatPositionInQueueLambdaFunction: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+          LambdaFunctionDisplayname: !Ref ChatPositionInQueueLambdaFunction
+      State: ACTIVE
+      Type: CUSTOMER_QUEUE
+
+  PositionInQueueCustomerWhisperRemoveRecordFlow:
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueCustomerWhisperRemoveRecord'
+      Description: Position In Queue Customer Whisper Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"80b95625-f54c-4fbc-8b3c-508c30982122\",\"Metadata\":{\"entryPointPosition\":{\"x\":14.4,\"y\":13.600000000000001},\"ActionMetadata\":{\"aec45209-5e30-42f5-bf80-a22e222cf946\":{\"position\":{\"x\":804,\"y\":156}},\"80b95625-f54c-4fbc-8b3c-508c30982122\":{\"position\":{\"x\":245.60000000000002,\"y\":84.80000000000001}},\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\":{\"position\":{\"x\":498.40000000000003,\"y\":88},\"parameters\":{\"LambdaFunctionARN\":{\"displayName\":\"${LambdaFunctionDisplayname}\"}},\"dynamicMetadata\":{\"operation\":false}}}},\"Actions\":[{\"Parameters\":{},\"Identifier\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"Type\":\"EndFlowExecution\",\"Transitions\":{}},{\"Parameters\":{\"Text\":\"You are now being connected to an agent\"},\"Identifier\":\"80b95625-f54c-4fbc-8b3c-508c30982122\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\"}},{\"Parameters\":{\"LambdaFunctionARN\":\"${ChatPositionInQueueLambdaFunction}\",\"InvocationTimeLimitSeconds\":\"3\",\"LambdaInvocationAttributes\":{\"operation\":\"delete\"}},\"Identifier\":\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\",\"Type\":\"InvokeLambdaFunction\",\"Transitions\":{\"NextAction\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"Errors\":[{\"NextAction\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - ChatPositionInQueueLambdaFunction: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+          LambdaFunctionDisplayname: !Ref ChatPositionInQueueLambdaFunction
+      State: ACTIVE
+      Type: CUSTOMER_WHISPER
+
+
+  #####################################################
+  # Artifact S3 Bucket
+  #####################################################
+    BlogArtifacts:
+      Type: AWS::S3::Bucket
+      DeletionPolicy: Delete
+      UpdateReplacePolicy: Retain
+      Properties:
+        OwnershipControls:
+          Rules:
+            - ObjectOwnership: ObjectWriter
+        BucketEncryption: 
+          ServerSideEncryptionConfiguration: 
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+  #####################################################
+  # Artifact Lambda IAM Role
+  #####################################################
+    CopyArtifactsLambdaIamRole:
+      Type: 'AWS::IAM::Role'
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - 'sts:AssumeRole'
+        Path: /
+        Policies:
+          - PolicyName: root
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - 's3:PutObject'
+                  Resource: !Sub 'arn:aws:s3:::${BlogArtifacts}/*'
+                - Effect: Allow
+                  Action:
+                    - 's3:GetObject'
+                    - 's3:GetObjectVersion'
+                  Resource:
+                  - !Sub 
+                      - arn:aws:s3:::${S3BucketName}/*
+                      - S3BucketName: !FindInMap [CFTParameters, "S3Bucket", "Name"]
+                - Effect: Allow
+                  Action:
+                    - 's3:ListBucket'
+                    - 's3:ListBucketVersions'
+                  Resource: 
+                    - !Sub 
+                        - arn:aws:s3:::${S3BucketName}/*
+                        - S3BucketName: !FindInMap [CFTParameters, "S3Bucket", "Name"]
+                    - !Sub 'arn:aws:s3:::${BlogArtifacts}/*'
+                - Effect: Allow
+                  Action:
+                    - 's3:DeleteObject'
+                  Resource: 
+                    - !Sub 'arn:aws:s3:::${BlogArtifacts}/*'
+        ManagedPolicyArns: 
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    #####################################################
+    # Custom resource trigger to copy artifacts
+    #####################################################
+    CopyCfnStacksLambdaTrigger:
+      Type: 'Custom::CopyCfnResources'
+      Properties:
+        ServiceToken: !GetAtt CustomResourceCopySourceFunction.Arn
+        BlogArtifacts: !Ref BlogArtifacts
+        SourceBucket: !FindInMap [CFTParameters, "S3Bucket", "Name"]
+        SourcePrefix: !FindInMap [CFTParameters, "S3Prefix", "Value"]
+      DependsOn: CustomResourceCopySourceFunction
+    
+    #####################################################
+    # Copy Layer Helper Function
+    #####################################################
+    CustomResourceCopySourceFunction:
+        Type: 'AWS::Lambda::Function'
+        Properties:
+          Role: !GetAtt CopyArtifactsLambdaIamRole.Arn
+          Handler: "index.handler"
+          Runtime: "nodejs16.x"
+          Code:
+            ZipFile: |
+              // Copyright 2022 Amazon.com and its affiliates; all rights reserved. This file is Amazon Web Services Content and may not be duplicated or distributed without permission.
+              const s3 = new (require('aws-sdk')).S3();
+              const response = require('cfn-response');
+              
+              const sourceObjectArray = [
+                'frontend/static/css/main.09784eec.css',
+                'frontend/static/css/main.09784eec.css.map',
+                'frontend/static/js/787.91799eaa.chunk.js',
+                'frontend/static/js/787.91799eaa.chunk.js.map',
+                'frontend/static/js/main.3336631e.js.LICENSE.txt',
+                'frontend/static/js/main.3336631e.js.map',
+                'frontend/static/js/main.3336631e.js',
+                'frontend/static/media/ico_connect.c4b4b06e46441b63ec178326f8a9e34e.svg',
+                'frontend/asset-manifest.json',
+                'frontend/config.js',
+                'frontend/favicon.ico',
+                'frontend/favicon.png',
+                'frontend/index.html',
+                'frontend/robots.txt',
+                'uuid-layer.zip'
+              ];
+              exports.handler = async (event, context) => {
+                  const sourceBucket = event.ResourceProperties.SourceBucket;
+                  const sourcePrefix = event.ResourceProperties.SourcePrefix;
+                  console.log(event);
+                  var result = {responseStatus: 'FAILED', responseData: {Data: 'Never updated'}};
+                  try {
+                      console.log(`Received event with type ${event.RequestType}`); 
+                      if(event.RequestType === 'Create' || event.RequestType === 'Update') {
+                          copyResult = await Promise.all(
+                              sourceObjectArray.map( async (object) => {
+                                  console.log('Copying with', object, `${sourceBucket}/${sourcePrefix}/${object}`)
+                                  s3Result = await s3.copyObject({
+                                      Bucket: event.ResourceProperties.BlogArtifacts,
+                                      Key: object,
+                                      CopySource: `${sourceBucket}/${sourcePrefix}/${object}`
+                                  }).promise();
+                                  console.log(`Finished uploading File with result ${JSON.stringify(s3Result, 0, 4)}`);
+                              }),
+                          );
+                          result.responseStatus = 'SUCCESS';
+                          result.responseData['Data'] = 'Successfully uploaded files';
+                      } else if (event.RequestType === 'Delete') {
+                          cleanupResult = await Promise.all(
+                              sourceObjectArray.map( async (object) => {
+                                  s3Result = await s3.deleteObjects({
+                                      Bucket: event.ResourceProperties.BlogArtifacts,
+                                      Delete: { Objects: [{Key: object }]}
+                                  }).promise();
+                                  console.log(`Finished deleting files with result ${JSON.stringify(s3Result, 0, 4)}`);
+                              }),
+                          );                        
+                          result.responseStatus = 'SUCCESS',
+                          result.responseData['Data'] = 'Successfully deleted files';
+                      }
+                  } catch (error) {
+                      console.log(JSON.stringify(error, 0, 4));
+                      result.responseStatus = 'FAILED';
+                      result.responseData['Data'] = 'Failed to process event';
+                  } finally {
+                      return await responsePromise(event, context, result.responseStatus, result.responseData, `mainstack`);
+                  }
+              };
+              function responsePromise(event, context, responseStatus, responseData, physicalResourceId) {
+                  return new Promise(() => response.send(event, context, responseStatus, responseData, physicalResourceId));
+              }
+          Timeout: 50
+
+
+
+
+    UserPool:
+        Type: AWS::Cognito::UserPool
+        Properties:
+            UserPoolName: !Sub ${AWS::StackName}-user-pool
+            UsernameConfiguration:
+                CaseSensitive: false
+            AutoVerifiedAttributes:
+                - email
+            Schema:
+                - Name: email
+                  AttributeDataType: String
+                  Mutable: false
+                  Required: true
+            AliasAttributes:
+                - email
+
+    UserPoolUser:
+        Type: AWS::Cognito::UserPoolUser
+        Properties:
+            DesiredDeliveryMediums:
+                - EMAIL
+            ForceAliasCreation: true
+            Username: admin
+            UserPoolId: !Ref UserPool
+            UserAttributes:
+                - Name: email
+                  Value: !Ref AdminEmailAddress
+
+    UserPoolClient:
+        Type: AWS::Cognito::UserPoolClient
+        Properties:
+            ClientName: "post-contact-survey-frontend"
+            ExplicitAuthFlows:
+                - ALLOW_CUSTOM_AUTH
+                - ALLOW_USER_SRP_AUTH
+                - ALLOW_REFRESH_TOKEN_AUTH
+            UserPoolId: !Ref UserPool
+
+    FrontEndS3BucketPolicy:
+        Type: AWS::S3::BucketPolicy
+        Properties:
+            Bucket: !Ref FrontEndS3Bucket
+            PolicyDocument:
+                Version: "2012-10-17"
+                Id: "PolicyForCloudFrontPrivateContent"
+                Statement:
+                    - Action:
+                          - "s3:GetObject"
+                      Effect: Allow
+                      Resource: !Join ["", [!GetAtt FrontEndS3Bucket.Arn, "/*"]]
+                      Principal:
+                          CanonicalUser: !GetAtt [CDNOriginIdentity, S3CanonicalUserId]
+
+    FrontEndS3Bucket:
+        Type: AWS::S3::Bucket
+        Properties:
+          OwnershipControls:
+            Rules:
+              - ObjectOwnership: ObjectWriter
+
+    CDNOriginIdentity:
+        Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+        Properties:
+            CloudFrontOriginAccessIdentityConfig:
+                Comment: !Sub "Cloudfront Origin identity"
+
+    CustomCachePolicy:
+        Type: AWS::CloudFront::CachePolicy
+        Properties:
+            CachePolicyConfig:
+                Comment: String
+                DefaultTTL: 3600
+                MaxTTL: 86400
+                MinTTL: 500
+                Name: !Sub "CustomCachePolicy_${AWS::StackName}"
+                ParametersInCacheKeyAndForwardedToOrigin:
+                    CookiesConfig:
+                        CookieBehavior: none
+                    EnableAcceptEncodingBrotli: true
+                    EnableAcceptEncodingGzip: true
+                    HeadersConfig:
+                        HeaderBehavior: whitelist
+                        Headers:
+                            - Authorization
+                    QueryStringsConfig:
+                        QueryStringBehavior: none
+
+    CustomOriginRequestPolicy:
+        Type: AWS::CloudFront::OriginRequestPolicy
+        Properties:
+            OriginRequestPolicyConfig:
+                Name: !Sub "CustomOriginRequestPolicy_${AWS::StackName}"
+                CookiesConfig:
+                    CookieBehavior: all
+                HeadersConfig:
+                    HeaderBehavior: none
+                QueryStringsConfig:
+                    QueryStringBehavior: all
+
+    CloudFrontDistribution:
+        Type: "AWS::CloudFront::Distribution"
+        Properties:
+            DistributionConfig:
+                CustomErrorResponses:
+                    - ErrorCode: 404
+                      ResponseCode: 200
+                      ResponsePagePath: "/index.html"
+                    - ErrorCode: 403
+                      ResponseCode: 200
+                      ResponsePagePath: "/index.html"
+                DefaultCacheBehavior:
+                    AllowedMethods:
+                        - GET
+                        - HEAD
+                        - OPTIONS
+                    ForwardedValues:
+                        Cookies:
+                            Forward: none
+                        QueryString: false
+                    TargetOriginId: !Sub "S3-origin-${FrontEndS3Bucket}"
+                    ViewerProtocolPolicy: redirect-to-https
+                DefaultRootObject: index.html
+                Enabled: True
+                HttpVersion: http2
+                Origins:
+                    - DomainName: !GetAtt FrontEndS3Bucket.RegionalDomainName
+                      Id: !Sub "S3-origin-${FrontEndS3Bucket}"
+                      S3OriginConfig:
+                          OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${CDNOriginIdentity}"
+                    - DomainName: !Sub "${SurveysApiGateway}.execute-api.${AWS::Region}.amazonaws.com"
+                      Id: !Sub "API-origin-${SurveysApiGateway}"
+                      CustomOriginConfig:
+                          OriginSSLProtocols:
+                              - "TLSv1.2"
+                          OriginProtocolPolicy: https-only
+                CacheBehaviors:
+                    - TargetOriginId: !Sub "API-origin-${SurveysApiGateway}"
+                      CachePolicyId: !Ref CustomCachePolicy
+                      Compress: true
+                      PathPattern: "dev/*"
+                      ViewerProtocolPolicy: "redirect-to-https"
+                      OriginRequestPolicyId: !Ref CustomOriginRequestPolicy
+                      AllowedMethods:
+                          - HEAD
+                          - DELETE
+                          - POST
+                          - GET
+                          - OPTIONS
+                          - PUT
+                          - PATCH
+                PriceClass: PriceClass_All
+
+    LambdaUuidLayer:
+        Type: AWS::Lambda::LayerVersion
+        DependsOn: CopyCfnStacksLambdaTrigger
+        Properties:
+            CompatibleArchitectures:
+                - x86_64
+            CompatibleRuntimes:
+                - nodejs16.x
+            Content:
+                S3Bucket: !Ref BlogArtifacts
+                S3Key: 'uuid-layer.zip'
+            LayerName: !Sub ${AWS::StackName}-uuid-layer
+
+    LambdaWriteSurveysResults:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - LambdaUuidLayer
+        Properties:
+            Description: "Called by Amazon Connect contact flows to write results of a completed survey"
+            Handler: index.handler
+            Runtime: nodejs16.x
+            Role: !GetAtt LambdaWriteSurveyResultsRole.Arn
+            FunctionName: !Sub ${AWS::StackName}-surveys-write-results
+            Timeout: 12
+            Layers:
+                - !Ref LambdaUuidLayer
+            Code:
+                ZipFile: |
+                    // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+                    // SPDX-License-Identifier: MIT-0
+
+                    const AWS = require('aws-sdk');
+                    const ddb = new AWS.DynamoDB();
+
+                    exports.handler = async (event) => {
+                        
+                        var surveyResults = {};
+                        var data = event.Details.ContactData.Attributes;
+                        
+                        Object.keys(data).forEach(element => {
+                          if (element.startsWith("survey_result_")) {
+                              surveyResults[element] = { S: data[element] };
+                          }
+                        });
+                        
+                        var params = {
+                            TableName: process.env.TABLE,
+                            Item: {
+                                contactId: { S: event.Details.ContactData.ContactId},
+                                surveyId: { S: event.Details.ContactData.Attributes.surveyId },
+                                ...surveyResults,
+                                timestamp: { N: (Date.now() / 1000).toString() }
+                            }
+                        }
+                        
+                        try {
+                            await ddb.putItem(params).promise();
+                        } catch (err) {
+                            console.log(err);
+                        }
+
+                        const response = {
+                            statusCode: 200,
+                            body: JSON.stringify('OK'),
+                        };
+                        return response;
+                    };
+
+            Environment:
+                Variables:
+                    TABLE: !Ref SurveysResultsDDBTable
+
+    LambdaSurveyApi:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - LambdaUuidLayer
+        Properties:
+            Description: "The backend for the API powering the Amazon Connect Post Call Surveys Manager"
+            Handler: index.handler
+            Runtime: nodejs16.x
+            Role: !GetAtt LambdaSurveysApiRole.Arn
+            FunctionName: !Sub ${AWS::StackName}-surveys-api
+            Timeout: 12
+            Layers:
+                - !Ref LambdaUuidLayer
+            Code:
+                ZipFile: |
+                    // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+                    // SPDX-License-Identifier: MIT-0
+
+                    const AWS = require('aws-sdk');
+                    const docClient = new AWS.DynamoDB.DocumentClient();
+                    const ddb = new AWS.DynamoDB();
+
+                    const { v4: uuid } = require('uuid');
+                    const OPERATIONS = ['create', 'update', 'list', 'delete', 'results'];
+
+
+                    const scanTable = async (tableName) => {
+                        const params = {
+                            TableName: tableName,
+                        };
+
+                        const scanResults = [];
+                        var lastEvaluatuedKey;
+                        do {
+                            const items = await docClient.scan(params).promise();
+                            lastEvaluatuedKey = items.LastEvaluatedKey
+                            items.Items.forEach((item) => scanResults.push(item));
+                            params.ExclusiveStartKey = items.LastEvaluatedKey;
+                        } while (typeof lastEvaluatuedKey !== "undefined");
+
+                        return scanResults;
+
+                    };
+
+                    exports.handler = async (event) => {
+
+                        const response = {
+                            "headers": {
+                                "Content-Type": "application/json",
+                                "Access-Control-Allow-Origin": "*",
+                            }
+                        };
+                        
+                        let operation = undefined;
+
+                        if (!validateRequest()) {
+                            return response;
+                        }
+
+                        let body = {};
+
+                        switch (operation) {
+                            case 'list':
+
+                                let data = await listSurveys();
+
+                                if (data) {
+                                    response.statusCode = 200;
+                                    body.success = "true";
+                                    body.data = data;
+                                }
+                                else {
+                                    response.statusCode = 500;
+                                    body.sucess = false;
+                                    body.message = "Something went terribly wrong."
+                                }
+
+                                response.body = JSON.stringify(body);
+
+                                break;
+
+                            case 'create':
+                                let surveyData = JSON.parse(event.body).data;
+
+                                if (!surveyData) {
+                                    response.statusCode = 400;
+                                    body.sucess = false;
+                                    body.message = "Unsupported operation."
+
+                                    response.body = JSON.stringify(body);
+                                }
+                                else {
+
+                                    let questions = {};
+                                    surveyData.questions.forEach((question, index) => {
+                                        questions[`question_${index + 1}`] = { S: question };
+                                    });
+
+                                    let flags = {};
+                                    surveyData.flags.forEach((flag, index) => {
+                                        flags[`flag_question_${index + 1}`] = { N: flag.toString() };
+                                    });
+                                    
+                                    var surveyId = surveyData.surveyId == "" ? uuid() : surveyData.surveyId;
+
+                                    let item = {
+                                        TableName: process.env.TABLE_SURVEYS_CONFIG,
+                                        Item: {
+                                            surveyId: { S: surveyId },
+                                            surveyName: { S: surveyData.surveyName },
+                                            min: { N: surveyData.min.toString() },
+                                            max: { N: surveyData.max.toString() },
+                                            introPrompt: { S: surveyData.introPrompt },
+                                            outroPrompt: { S: surveyData.outroPrompt },
+                                            ...questions,
+                                            ...flags
+                                        }
+                                    };
+
+                                    surveyData.questions.forEach((question, index) => {
+                                        item.Item[`question_${index + 1}`] = { S: question };
+                                    });
+
+                                    let res = await ddb.putItem(item).promise();
+                                    
+                                    response.statusCode = 200;
+                                    body.success = true;
+                                    body.data = surveyId;
+                                    
+                                    response.body = JSON.stringify(body);
+                                    
+                                }
+
+                                break;
+
+                            case 'delete':
+                                var surveyId = JSON.parse(event.body).data.surveyId;
+                                
+                                let survey = {
+                                    TableName: process.env.TABLE_SURVEYS_CONFIG,
+                                    Key: {
+                                        surveyId: { S: surveyId }
+                                    }
+                                };
+                                
+                                let res = await ddb.deleteItem(survey).promise();
+                                
+                                break;
+                                
+                            case 'results': 
+
+                                let queryParams = {
+                                    TableName: process.env.TABLE_SURVEYS_RESULTS,
+                                    FilterExpression: "surveyId = :id",
+                                    ExpressionAttributeValues: {
+                                        ":id": JSON.parse(event.body).data.surveyId
+                                    }
+                                }
+                                
+                                response.statusCode = 200;
+                                body.success = true;
+                                body.data = await getResults(queryParams);
+                                
+                                response.body = JSON.stringify(body);
+
+                                break;
+
+                            default:
+                                response.statusCode = 400;
+                                body.sucess = false;
+                                body.message = "Unsupported operation."
+
+                                response.body = JSON.stringify(body);
+
+                                break;
+                        }
+
+                        return response;
+                        
+                        async function getResults (params) {
+                            const scanResults = [];
+                            
+                            var lastEvaluatuedKey;
+                            do {
+                                const items = await docClient.scan(params).promise();
+                                lastEvaluatuedKey = items.LastEvaluatedKey
+                                items.Items.forEach((item) => scanResults.push(item));
+                                params.ExclusiveStartKey = items.LastEvaluatedKey;
+                            } while (typeof lastEvaluatuedKey !== "undefined");
+
+                            return scanResults;
+
+                        };
+
+                        async function listSurveys() {
+                            try {
+                                return await scanTable(process.env.TABLE_SURVEYS_CONFIG);
+                            }
+                            catch (e) {
+                                console.log(e);
+
+                                return undefined;
+                            }
+                        }
+
+                        function validateRequest() {
+
+                            if (event.httpMethod === 'POST') {
+                                try {
+                                    var body = JSON.parse(event.body);
+                                }
+                                catch (e) {
+                                    console.log(e);
+
+                                    response.statusCode = 400;
+                                    response.body = "Body is not valid JSON";
+
+                                    return false;
+                                }
+
+                                if (!body.operation) {
+                                    response.statusCode = 400;
+                                    response.body = "No operation specified";
+
+                                    return false;
+                                }
+
+                                if (!OPERATIONS.includes(body.operation)) {
+                                    response.statusCode = 400;
+                                    response.body = "Unsupported operation";
+
+                                    return false;
+                                }
+
+                                operation = body.operation;
+                            }
+
+                            return true;
+                        }
+                    };
+
+            Environment:
+                Variables:
+                    TABLE_SURVEYS_CONFIG: !Ref SurveysConfigDDBTable
+                    TABLE_SURVEYS_RESULTS: !Ref SurveysResultsDDBTable
+
+    LambdaGetSurveyConfig:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - LambdaUuidLayer
+        Properties:
+            Description: "Called by Amazon Connect contact flows to retrieve a survey configuration"
+            Handler: index.handler
+            Runtime: nodejs16.x
+            Role: !GetAtt LambdaGetSurveyConfigRole.Arn
+            FunctionName: !Sub ${AWS::StackName}-surveys-get-survey-config
+            Timeout: 12
+            Code:
+                ZipFile: |
+                    // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+                    // SPDX-License-Identifier: MIT-0
+
+                    const AWS = require('aws-sdk');
+                    const ddb = new AWS.DynamoDB();
+
+                    exports.handler = async (event) => {
+
+                        const response = {};
+
+                        var params = {
+                            TableName: process.env.TABLE,
+                            Key: {
+                                'surveyId': { S: event.Details.Parameters.surveyId }
+                            }
+                        };
+                        
+                        try {
+                            let res = await ddb.getItem(params).promise();
+                            response.statusCode = 200;
+                            
+                            if (res.Item) {
+                                response.message = 'OK';
+                                
+                                let size = 0;
+                                Object.keys(res.Item).forEach(k => {
+                                    if (res.Item[k].S) {
+                                        response[k] = res.Item[k].S;
+                                    }
+                                    
+                                    if (res.Item[k].N) {
+                                        response[k] = res.Item[k].N;
+                                    }
+                                    
+                                    size = k.startsWith('question') ? size + 1 : size;
+                                });
+                                
+                                response.surveySize = size;
+                            } else {
+                                response.message = `Couldn't find configuration for survey with id [${event.Details.Parameters.surveyId}]`;
+                            }
+                            
+                        } catch (err) {
+                            console.log(err);
+                        }
+                        
+                        return response;
+                    };
+
+            Environment:
+                Variables:
+                    TABLE: !Ref SurveysConfigDDBTable
+
+    LambdaProcessSurveyFlagsConfig:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - LambdaUuidLayer
+        Properties:
+            Description: "Called by Amazon Connect contact flows to determine if tasks should be sent to alert on survey results"
+            Handler: index.handler
+            Runtime: nodejs16.x
+            Role: !GetAtt LambdaProcessSurveysFlagsRole.Arn
+            FunctionName: !Sub ${AWS::StackName}-process-survey-flags
+            Timeout: 12
+            Layers:
+                - !Ref LambdaUuidLayer
+            Environment:
+                Variables:
+                    CONTACT_FLOW_ID: !Ref ContactFlowIdForTasks
+                    INSTANCE_NAME: !Ref AmazonConnectInstanceName
+            Code:
+                ZipFile: |
+                    // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+                    // SPDX-License-Identifier: MIT-0
+
+                    const AWS = require('aws-sdk');
+                    const connect = new AWS.Connect();
+
+                    const { v4: uuid } = require('uuid');
+
+                    String.prototype.rsplit = function(sep, maxsplit) {
+                        var split = this.split(sep);
+                        return maxsplit ? [split.slice(0, -maxsplit).join(sep)].concat(split.slice(-maxsplit)) : split;
+                    };
+
+                    exports.handler = async (event) => {
+
+                        let flagged = {};
+                        let surveyKeys = Object.keys(event.Details.ContactData.Attributes).filter(o => o.startsWith("survey_result_"));
+                        surveyKeys.sort();
+                        
+                        surveyKeys.forEach((key, index) => {
+                            console.log(`Processing ${key}`);
+                            if (event.Details.Parameters[`flag_question_${index + 1}`] && event.Details.Parameters[`flag_question_${index + 1}`] != '') {
+                                console.log(`Flag exists for ${key} with threshold ${event.Details.Parameters[`flag_question_${index + 1}`]}`);
+                                if (parseInt(event.Details.ContactData.Attributes[key]) < parseInt(event.Details.Parameters[`flag_question_${index + 1}`])) {
+                                    flagged[key] = event.Details.Parameters[`flag_question_${index + 1}`];
+                                }
+                            }
+                        });
+
+                        if (Object.keys(flagged).length > 0) {
+
+                            let instanceId = event['Details']['ContactData']['InstanceARN'].rsplit("/", 1)[1];
+                            let description = "";
+                            
+                            Object.keys(flagged).forEach(key => {
+                                description += `Question ${key.substr(key.length - 1)}: ${flagged[key]}\n`;
+                            });
+                            
+                            var params = {
+                                ContactFlowId: process.env.CONTACT_FLOW_ID,
+                                InstanceId: instanceId,
+                                Name: 'Flagged Post Call Survey',
+                                Attributes: {
+                                    'surveyId': event['Details']['ContactData']['Attributes']['surveyId'],
+                                    'contactId': event['Details']['ContactData']['ContactId'],
+                                },
+                                ClientToken: uuid(),
+                                Description: description,
+                                References: {
+                                    'CTR': {
+                                        Type: 'URL',
+                                        Value: `https://${process.env.INSTANCE_NAME}.my.connect.aws/contact-trace-records/details/${event['Details']['ContactData']['ContactId']}`
+                                    },
+                                },
+                            };
+                            
+                            try {
+                                let res = await connect.startTaskContact(params).promise();
+                            } catch (err) {
+                                console.log(err);
+                            }
+                            
+                        }
+
+                        // TODO implement
+                        const response = {
+                            statusCode: 200,
+                            body: JSON.stringify('OK'),
+                        };
+                        return response;
+                    };
+
+
+    LambdaSurveyUtils:
+        Type: AWS::Lambda::Function
+        DependsOn:
+            - LambdaUuidLayer
+        Properties:
+            Description: "A set of utilities for the solution to work"
+            Handler: index.handler
+            Runtime: nodejs16.x
+            Role: !GetAtt LambdaSurveysUtilsRole.Arn
+            FunctionName: !Sub ${AWS::StackName}-utils
+            Timeout: 12
+            Code:
+                ZipFile: |
+                    // Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+                    // SPDX-License-Identifier: MIT-0
+
+                    exports.handler = async (event) => {
+                        
+                        const response = {
+                            ...event.Details.Parameters
+                        };
+                        
+                        const operation = event.Details.Parameters.operation;
+                        
+                        if (!operation) {
+                            response.success = true;
+                            response.message = "No operation in input. Nothing to do."
+                            return response;
+                        }
+                        
+                        switch (operation) {
+                            case "getNextSurveyQuestion":
+                                const data = getNextSurveyQuestion();
+                                response.nextQuestion = data.nextQuestion;
+                                response.newCounter = data.newCounter;
+                                response.currentQuestionIndex = data.currentQuestionIndex;
+                                
+                                break;
+                                
+                            case "validateInput":
+                                response.validInput = `${validateInput()}`;
+                                response.message = `Your answer is not between ${event.Details.Parameters.min} and ${event.Details.Parameters.max}.`;
+                                response.nextQuestion = event.Details.Parameters[`question_${event.Details.ContactData.Attributes.loopCounter}`];
+                                
+                                break;
+                                
+                            default:
+                                response.success = false;
+                                response.message = "Unsupported operation."
+                        }
+
+                        return response;
+                        
+                        function validateInput() {
+                            let min = event.Details.Parameters.min;
+                            let max = event.Details.Parameters.max;
+                            
+                            return parseInt(min) <= parseInt(event.Details.Parameters.input) && parseInt(max) >= parseInt(event.Details.Parameters.input);
+                        }
+                        
+                        function getNextSurveyQuestion() {
+                            let res = {
+                                currentQuestionIndex: event.Details.ContactData.Attributes.loopCounter,
+                                nextQuestion: event.Details.Parameters[`question_${event.Details.ContactData.Attributes.loopCounter}`],
+                                newCounter: parseInt(event.Details.ContactData.Attributes.loopCounter) + 1
+                            };
+                            
+                            return res;
+                        }
+                    };
+
+
+    CognitoAuthorizer:
+        Type: AWS::ApiGateway::Authorizer
+        Properties:
+            IdentitySource: method.request.header.Authorization
+            Name: CognitoAuthorizer
+            ProviderARNs:
+                - !GetAtt UserPool.Arn
+            RestApiId: !Ref SurveysApiGateway
+            Type: COGNITO_USER_POOLS
+
+    ApiGatewayLoggingRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: apigateway.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+    ApiGatewayLoggingRoleSetup:
+        Type: AWS::ApiGateway::Account
+        DependsOn: 
+            - SurveysApiGateway
+            - ApiGatewayLoggingRole
+        Properties: 
+          CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+
+    SurveysApiGateway:
+        Type: AWS::ApiGateway::RestApi
+        Properties:
+            Name: !Sub ${AWS::StackName}-api-cf
+
+    SurveysApiDeployment:
+        Type: AWS::ApiGateway::Deployment
+        DependsOn:
+            - ApiSurveysAnyMethod
+            - ApiSurveysOptionsMethod
+            - ApiResultsAnyMethod
+            - ApiResultsOptionsMethod
+        Properties:
+            RestApiId: !Ref SurveysApiGateway
+            StageName: "DummyStage"
+
+    SurveysApiStage:
+        Type: AWS::ApiGateway::Stage
+        DependsOn:
+            - SurveysApiGateway
+            - ApiGatewayLoggingRoleSetup
+        Properties:
+            RestApiId: !Ref SurveysApiGateway
+            StageName: dev
+            DeploymentId: !Ref SurveysApiDeployment
+            MethodSettings:
+                - DataTraceEnabled: true
+                  HttpMethod: "*"
+                  LoggingLevel: "ERROR"
+                  ResourcePath: "/*"
+
+    ApiResultsOptionsMethod:
+        Type: AWS::ApiGateway::Method
+        Properties:
+            AuthorizationType: NONE
+            RestApiId: !Ref SurveysApiGateway
+            ResourceId: !Ref ApiResultsResource
+            HttpMethod: OPTIONS
+            Integration:
+                IntegrationResponses:
+                    - StatusCode: 200
+                      ResponseParameters:
+                          method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                          method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+                          method.response.header.Access-Control-Allow-Origin: "'*'"
+                      ResponseTemplates:
+                          application/json: ""
+                PassthroughBehavior: WHEN_NO_MATCH
+                RequestTemplates:
+                    application/json: '{"statusCode": 200}'
+                Type: MOCK
+            MethodResponses:
+                - StatusCode: 200
+                  ResponseModels:
+                      application/json: "Empty"
+                  ResponseParameters:
+                      method.response.header.Access-Control-Allow-Headers: false
+                      method.response.header.Access-Control-Allow-Methods: false
+                      method.response.header.Access-Control-Allow-Origin: false
+
+    ApiSurveysOptionsMethod:
+        Type: AWS::ApiGateway::Method
+        Properties:
+            AuthorizationType: NONE
+            RestApiId: !Ref SurveysApiGateway
+            ResourceId: !Ref ApiSurveysResource
+            HttpMethod: OPTIONS
+            Integration:
+                IntegrationResponses:
+                    - StatusCode: 200
+                      ResponseParameters:
+                          method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                          method.response.header.Access-Control-Allow-Methods: "'POST,GET,OPTIONS'"
+                          method.response.header.Access-Control-Allow-Origin: "'*'"
+                      ResponseTemplates:
+                          application/json: ""
+                PassthroughBehavior: WHEN_NO_MATCH
+                RequestTemplates:
+                    application/json: '{"statusCode": 200}'
+                Type: MOCK
+            MethodResponses:
+                - StatusCode: 200
+                  ResponseModels:
+                      application/json: "Empty"
+                  ResponseParameters:
+                      method.response.header.Access-Control-Allow-Headers: false
+                      method.response.header.Access-Control-Allow-Methods: false
+                      method.response.header.Access-Control-Allow-Origin: false
+
+    ApiSurveysResource:
+        Type: AWS::ApiGateway::Resource
+        Properties:
+            RestApiId: !Ref SurveysApiGateway
+            ParentId: !GetAtt SurveysApiGateway.RootResourceId
+            PathPart: "surveys"
+
+    ApiResultsResource:
+        Type: AWS::ApiGateway::Resource
+        Properties:
+            RestApiId: !Ref SurveysApiGateway
+            ParentId: !GetAtt SurveysApiGateway.RootResourceId
+            PathPart: "results"
+
+    ApiResultsAnyMethod:
+        Type: AWS::ApiGateway::Method
+        Properties:
+            AuthorizationType: COGNITO_USER_POOLS
+            AuthorizerId: !Ref CognitoAuthorizer
+            HttpMethod: "ANY"
+            ResourceId: !Ref ApiResultsResource
+            RestApiId: !Ref SurveysApiGateway
+            Integration:
+                Type: "AWS_PROXY"
+                IntegrationHttpMethod: "POST"
+                Uri:
+                    !Join [
+                        "",
+                        [
+                            "arn:aws:apigateway:",
+                            !Ref AWS::Region,
+                            ":lambda:path/2015-03-31/functions/",
+                            !GetAtt LambdaSurveyApi.Arn,
+                            "/invocations",
+                        ],
+                    ]
+            MethodResponses:
+                - StatusCode: 200
+                  ResponseModels:
+                      application/json: "Empty"
+                  ResponseParameters:
+                      method.response.header.Access-Control-Allow-Headers: false
+                      method.response.header.Access-Control-Allow-Methods: false
+                      method.response.header.Access-Control-Allow-Origin: false
+
+    ApiSurveysAnyMethod:
+        Type: AWS::ApiGateway::Method
+        Properties:
+            AuthorizationType: COGNITO_USER_POOLS
+            AuthorizerId: !Ref CognitoAuthorizer
+            HttpMethod: "ANY"
+            ResourceId: !Ref ApiSurveysResource
+            RestApiId: !Ref SurveysApiGateway
+            Integration:
+                Type: "AWS_PROXY"
+                IntegrationHttpMethod: "POST"
+                Uri:
+                    !Join [
+                        "",
+                        [
+                            "arn:aws:apigateway:",
+                            !Ref AWS::Region,
+                            ":lambda:path/2015-03-31/functions/",
+                            !GetAtt LambdaSurveyApi.Arn,
+                            "/invocations",
+                        ],
+                    ]
+            MethodResponses:
+                - StatusCode: 200
+                  ResponseModels:
+                      application/json: "Empty"
+                  ResponseParameters:
+                      method.response.header.Access-Control-Allow-Headers: false
+                      method.response.header.Access-Control-Allow-Methods: false
+                      method.response.header.Access-Control-Allow-Origin: false
+
+    LambdaSurveyApiPermission:
+        Type: AWS::Lambda::Permission
+        Properties:
+            Action: "lambda:invokeFunction"
+            FunctionName: !GetAtt LambdaSurveyApi.Arn
+            Principal: "apigateway.amazonaws.com"
+            SourceArn:
+                !Join [
+                    "",
+                    [
+                        "arn:aws:execute-api:",
+                        !Ref AWS::Region,
+                        ":",
+                        !Ref AWS::AccountId,
+                        ":",
+                        !Ref SurveysApiGateway,
+                        "/*",
+                    ],
+                ]
+
+    SurveysConfigDDBTable:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            AttributeDefinitions:
+                - AttributeName: surveyId
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: surveyId
+                  KeyType: HASH
+            TableName: !Sub ${AWS::StackName}-surveys-config
+            ProvisionedThroughput:
+                ReadCapacityUnits: 1
+                WriteCapacityUnits: 1
+
+    SurveysResultsDDBTable:
+        Type: AWS::DynamoDB::Table
+        Properties:
+            AttributeDefinitions:
+                - AttributeName: contactId
+                  AttributeType: S
+            KeySchema:
+                - AttributeName: contactId
+                  KeyType: HASH
+            TableName: !Sub ${AWS::StackName}-surveys-results
+            ProvisionedThroughput:
+                ReadCapacityUnits: 1
+                WriteCapacityUnits: 1
+
+    LambdaSurveysUtilsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+    LambdaProcessSurveysFlagsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: InlineConnectPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - connect:StartTaskContact
+                            Resource:
+                                - !Join ["/", [!Ref AmazonConnectInstanceARN, "contact-flow", !Ref ContactFlowIdForTasks]]
+
+    LambdaSurveysApiRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: InlineDDBPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                                - dynamodb:DeleteItem
+                                - dynamodb:UpdateItem
+                                - dynamodb:Scan
+                            Resource:
+                                - !GetAtt SurveysConfigDDBTable.Arn
+                                - !GetAtt SurveysResultsDDBTable.Arn
+                                - !Join ["/", [!GetAtt SurveysConfigDDBTable.Arn, "index/surveyId"]]
+                                - !Join ["/", [!GetAtt SurveysResultsDDBTable.Arn, "index/contactId"]]
+
+    LambdaGetSurveyConfigRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: InlineDDBPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:GetItem
+                                - dynamodb:Scan
+                            Resource:
+                                - !GetAtt SurveysConfigDDBTable.Arn
+                                - !Join ["/", [!GetAtt SurveysConfigDDBTable.Arn, "index/surveyId"]]
+
+    LambdaWriteSurveyResultsRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Version: "2012-10-17"
+                Statement:
+                    - Effect: Allow
+                      Principal:
+                          Service: lambda.amazonaws.com
+                      Action: sts:AssumeRole
+            ManagedPolicyArns:
+                - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+            Policies:
+                - PolicyName: InlineDDBPolicy
+                  PolicyDocument:
+                      Version: "2012-10-17"
+                      Statement:
+                          - Effect: Allow
+                            Action:
+                                - dynamodb:PutItem
+                            Resource:
+                                - !GetAtt SurveysResultsDDBTable.Arn
+                                - !Join ["/", [!GetAtt SurveysResultsDDBTable.Arn, "index/surveyId"]]
+
+    S3CustomResource:
+        Type: Custom::S3CustomResource
+        Properties:
+            ServiceToken: !GetAtt CustomResourceS3LambdaFunction.Arn
+            SourceBucket: !Ref BlogArtifacts
+            DestinationBucket: !Ref FrontEndS3Bucket
+        DependsOn: CopyCfnStacksLambdaTrigger
+
+    CustomResourceS3LambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Handler: index.handler
+            Role: !GetAtt CustomResourceS3LambdaExecutionRole.Arn
+            Timeout: 360
+            Runtime: nodejs16.x
+            Code:
+                ZipFile: |
+                    const AWS = require("aws-sdk");
+                    var response = require('cfn-response');
+                    const s3 = new AWS.S3();
+
+                    exports.handler = (event, context) => {
+
+                        const request = event.RequestType;
+
+                        switch (request) {
+                            case "Create":
+                                var params = {
+                                    Bucket: event.ResourceProperties.SourceBucket,
+                                    Prefix: "frontend"
+                                }
+
+                                console.log(params);
+
+                                getBucketContent(params).then((data) => {
+                                        copyObjects(data).then((data) => {
+                                                console.log("Object copied successfully");
+                                                response.send(event, context, response.SUCCESS, {});
+                                            })
+                                            .catch((e) => {
+                                                console.log(e);
+                                                response.send(event, context, response.FAILED, {});
+                                            })
+                                    })
+                                    .catch(e => {
+                                        console.log(e);
+                                    })
+
+                                break;
+                            case "Update":
+                                var params = {
+                                    Bucket: event.ResourceProperties.SourceBucket,
+                                    Prefix: "frontend"
+                                }
+                                getBucketContent(params).then((data) => {
+
+                                        copyObjects(data).then((data) => {
+                                                console.log("Object copied successfully");
+                                                response.send(event, context, response.SUCCESS, {});
+                                            })
+                                            .catch((e) => {
+                                                console.log(e);
+                                                response.send(event, context, response.FAILED, {});
+                                            })
+                                    })
+                                    .catch(e => {
+                                        console.log(e);
+                                        response.send(event, context, response.FAILED, {});
+                                    })
+
+                                break;
+                            case "Delete":
+                                var params = {
+                                    Bucket: event.ResourceProperties.DestinationBucket,
+                                    Prefix: ""
+                                }
+                                getBucketContent(params).then((data) => {
+
+                                        deleteObjects(data).then((data) => {
+                                                console.log("Objects deleted successfully");
+                                                response.send(event, context, response.SUCCESS, {});
+                                            })
+                                            .catch((e) => {
+                                                console.log(e);
+                                                response.send(event, context, response.FAILED, {});
+                                            })
+                                    })
+                                    .catch(e => {
+                                        console.log(e);
+                                        response.send(event, context, response.FAILED, {});
+                                    })
+
+                                break;
+                            default:
+                                console.log("Unsupported operation.");
+                                response.send(event, context, response.FAILED, {});
+                                console.log("Sending FAILED from default");
+                        }
+
+                        function getBucketContent(params) {
+                            return new Promise(async (res, rej) => {
+                                try {
+                                    const list = await s3.listObjectsV2(params).promise();
+
+                                    console.log("1. Listed content");
+                                    res(list);
+                                }
+                                catch (e) {
+                                    rej(e);
+                                }
+
+                            });
+                        }
+
+                        function copyObjects(data) {
+                            return new Promise(async (res, rej) => {
+                                for (let index in data.Contents) {
+                                    var params = {
+                                        Bucket: event.ResourceProperties.DestinationBucket,
+                                        CopySource: event.ResourceProperties.SourceBucket + "/" + data.Contents[index].Key,
+                                        Key: data.Contents[index].Key.replace("frontend/", "")
+                                    }
+
+                                    try {
+                                        const res = await s3.copyObject(params).promise();
+                                    }
+                                    catch (e) {
+                                        rej(e);
+                                    }
+                                }
+                                console.log("1. Finished copying");
+
+                                res(true);
+                            });
+                        }
+
+                        function deleteObjects(data) {
+                            return new Promise(async (res, rej) => {
+                                for (let index in data.Contents) {
+                                    var params = {
+                                        Bucket: event.ResourceProperties.DestinationBucket,
+                                        Key: data.Contents[index].Key
+                                    }
+
+                                    try {
+                                        console.log(params);
+                                        const res = await s3.deleteObject(params).promise();
+                                        console.log(res)
+                                    }
+                                    catch (e) {
+                                        rej(e);
+                                    }
+                                }
+                                console.log("1. Finished deleting");
+
+                                res(true);
+                            });
+                        }
+                    };
+
+    CustomResourceS3LambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Statement:
+                    - Action:
+                          - sts:AssumeRole
+                      Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                Version: "2012-10-17"
+            Path: "/"
+            Policies:
+                - PolicyDocument:
+                      Statement:
+                          - Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Effect: Allow
+                            Resource: arn:aws:logs:*:*:*
+                      Version: "2012-10-17"
+                  PolicyName: !Sub ${AWS::StackName}-CustomResource-CW
+                - PolicyDocument:
+                      Statement:
+                          - Action:
+                                - s3:DeleteObject
+                                - s3:List*
+                                - s3:GetObject
+                                - s3:PutObject
+                            Effect: Allow
+                            Resource:
+                                - !Sub
+                                    - arn:aws:s3:::${S3BucketName}/*
+                                    - S3BucketName: !Ref BlogArtifacts
+                                - !Sub 
+                                    - arn:aws:s3:::${S3BucketName}
+                                    - S3BucketName: !Ref BlogArtifacts
+                                - !Sub arn:aws:s3:::${FrontEndS3Bucket}/*
+                                - !Sub arn:aws:s3:::${FrontEndS3Bucket}
+                      Version: "2012-10-17"
+                  PolicyName: !Sub ${AWS::StackName}-CustomResourceLambda-S3
+
+    LambdaCustomResource:
+        Type: Custom::LambdaCustomResource
+        DependsOn:
+            - S3CustomResource
+        Properties:
+            ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+            CognitoPoolId: !Ref UserPool
+            CognitoClientId: !Ref UserPoolClient
+            ApiEndpoint: !GetAtt CloudFrontDistribution.DomainName
+            BucketName: !Ref FrontEndS3Bucket
+
+    CustomResourceLambdaFunction:
+        Type: "AWS::Lambda::Function"
+        Properties:
+            Handler: index.handler
+            Role: !GetAtt CustomResourceLambdaExecutionRole.Arn
+            Timeout: 10
+            Runtime: nodejs16.x
+            Code:
+                ZipFile: |
+                    var response = require('cfn-response');
+                    const AWS = require('aws-sdk');
+                    const s3 = new AWS.S3();
+
+                    exports.handler = (event, context) => {
+
+                        const request = event.RequestType;
+
+                        if (request == "Create" || request == "Update") {
+                            const content = `window.app_configuration = { cognito_pool_id: "${event.ResourceProperties.CognitoPoolId}", cognito_client_id: "${event.ResourceProperties.CognitoClientId}", api_endpoint: "/dev/surveys" }`;
+
+                            var params = {
+                                Body: content,
+                                Bucket: event.ResourceProperties.BucketName,
+                                Key: "config.js",
+                                ContentType: "application/javascript"
+                            }
+
+                            s3.putObject(params, function(err, data) {
+                                if (err) {
+                                    console.log(err);
+                                    response.send(event, context, response.FAILED, {});
+                                } else {
+                                    response.send(event, context, response.SUCCESS, {});
+                                }
+                            });        
+                        } else {
+                            response.send(event, context, response.SUCCESS, {});
+                        }
+                    };
+
+    CustomResourceLambdaExecutionRole:
+        Type: AWS::IAM::Role
+        Properties:
+            AssumeRolePolicyDocument:
+                Statement:
+                    - Action:
+                          - sts:AssumeRole
+                      Effect: Allow
+                      Principal:
+                          Service:
+                              - lambda.amazonaws.com
+                Version: "2012-10-17"
+            Path: "/"
+            Policies:
+                - PolicyDocument:
+                      Statement:
+                          - Action:
+                                - logs:CreateLogGroup
+                                - logs:CreateLogStream
+                                - logs:PutLogEvents
+                            Effect: Allow
+                            Resource: arn:aws:logs:*:*:*
+                      Version: "2012-10-17"
+                  PolicyName: !Sub ${AWS::StackName}-CRLambda-logs
+                - PolicyDocument:
+                      Statement:
+                          - Action:
+                                - s3:PutObject
+                            Effect: Allow
+                            Resource:
+                                - !Join ["/", [!GetAtt FrontEndS3Bucket.Arn, "config.js"]]
+                      Version: "2012-10-17"
+                  PolicyName: !Sub ${AWS::StackName}-CRLambda-config
+
+    ConnectFunctionPolicyLambdaGetSurveyConfig:
+        Type: AWS::Lambda::Permission
+        DependsOn: LambdaGetSurveyConfig
+        Properties:
+          FunctionName: !Ref LambdaGetSurveyConfig
+          Action: "lambda:InvokeFunction"
+          Principal:  "connect.amazonaws.com"
+          SourceAccount: !Sub ${AWS::AccountId}
+          SourceArn: !Ref AmazonConnectInstanceARN
+
+    ConnectFunctionPolicyLambdaWriteSurveysResults:
+        Type: AWS::Lambda::Permission
+        DependsOn: LambdaWriteSurveysResults
+        Properties:
+          FunctionName: !Ref LambdaWriteSurveysResults
+          Action: "lambda:InvokeFunction"
+          Principal:  "connect.amazonaws.com"
+          SourceAccount: !Sub ${AWS::AccountId}
+          SourceArn: !Ref AmazonConnectInstanceARN
+
+    ConnectFunctionPolicyLambdaSurveyUtils:
+        Type: AWS::Lambda::Permission
+        DependsOn: LambdaSurveyUtils
+        Properties:
+          FunctionName: !Ref LambdaSurveyUtils
+          Action: "lambda:InvokeFunction"
+          Principal:  "connect.amazonaws.com"
+          SourceAccount: !Sub ${AWS::AccountId}
+          SourceArn: !Ref AmazonConnectInstanceARN
+
+    ConnectFunctionPolicyLambdaProcessSurveyFlagsConfig:
+        Type: AWS::Lambda::Permission
+        DependsOn: LambdaProcessSurveyFlagsConfig
+        Properties:
+          FunctionName: !Ref LambdaProcessSurveyFlagsConfig
+          Action: "lambda:InvokeFunction"
+          Principal:  "connect.amazonaws.com"
+          SourceAccount: !Sub ${AWS::AccountId}
+          SourceArn: !Ref AmazonConnectInstanceARN
+
+    ContactFlowModule:
+        Type: AWS::Connect::ContactFlowModule
+        DependsOn:
+            - ConnectFunctionPolicyLambdaGetSurveyConfig
+            - ConnectFunctionPolicyLambdaWriteSurveysResults
+            - ConnectFunctionPolicyLambdaSurveyUtils
+            - ConnectFunctionPolicyLambdaProcessSurveyFlagsConfig
+        Properties:
+            Content: !Sub '{"Version":"2019-10-30","StartAction":"4aa37d68-34fd-4cbf-af84-dd86cd97d758","Metadata":{"entryPointPosition":{"x":14.4,"y":14.4},"ActionMetadata":{"eda22bf3-c3f9-459f-8374-d56f84620644":{"position":{"x":345.6,"y":757.6}},"54b8b0f4-53b1-493a-9b74-e4056d92400e":{"position":{"x":2129.6,"y":240.8}},"f669287d-527d-41b9-b6e3-ecdbc330755c":{"position":{"x":2352.8,"y":225.60000000000002},"parameters":{"Attributes":{"loopCounter":{"useDynamic":true}}},"dynamicParams":["loopCounter"]},"8c223e1b-d94a-4b9c-acb5-3f400b030105":{"position":{"x":2136.8,"y":512},"parameters":{"Attributes":{"survey_result_$.Attributes.loopCounter":{"useDynamic":true}}},"dynamicParams":["survey_result_$.Attributes.loopCounter"]},"178a925b-dc1c-4d84-ab5f-84f50b5e8a2e":{"position":{"x":2653.6000000000004,"y":782.4000000000001}},"241f8a68-56ff-49a2-99ee-68625cd82310":{"position":{"x":2364.8,"y":502.40000000000003},"parameters":{"Attributes":{"loopCounter":{"useDynamic":true}}},"dynamicParams":["loopCounter"]},"3bb7ac4c-4ebf-4c6d-ab1f-fbdbdf8a0748":{"position":{"x":632,"y":284.8},"parameters":{"Text":{"useDynamic":true}},"useDynamic":true},"e15e93de-3bae-47a8-ae59-d38b239849ce":{"position":{"x":344,"y":516.8000000000001}},"ce7cd3b5-5eec-4d7f-802c-f1e8621baccd":{"position":{"x":304,"y":277.6},"parameters":{"Attributes":{"surveyId":{"useDynamic":true},"intro":{"useDynamic":true},"surveySize":{"useDynamic":true},"outro":{"useDynamic":true}}},"dynamicParams":["surveyId","intro","surveySize","outro"]},"f1ec1587-371d-4b88-aeb0-cf92c3b10a3e":{"position":{"x":62.400000000000006,"y":489.6}},"4aa37d68-34fd-4cbf-af84-dd86cd97d758":{"position":{"x":184.8,"y":49.6}},"768119b4-b9c1-4f0d-85b0-3bb77958e1d0":{"position":{"x":58.400000000000006,"y":280.8},"parameters":{"LambdaFunctionARN":{"displayName":"${LambdaGetSurveyConfig}"},"LambdaInvocationAttributes":{"surveyId":{"useDynamic":true}}},"dynamicMetadata":{"surveyId":true}},"224cfa54-c321-454b-8911-007386bd9fd3":{"position":{"x":1220,"y":280},"parameters":{"LambdaFunctionARN":{"displayName":"${LambdaSurveyUtils}"},"LambdaInvocationAttributes":{"max":{"useDynamic":true},"flag_question_3":{"useDynamic":true},"flag_question_2":{"useDynamic":true},"flag_question_5":{"useDynamic":true},"min":{"useDynamic":true},"currentQuestionIndex":{"useDynamic":true},"flag_question_4":{"useDynamic":true},"flag_question_1":{"useDynamic":true},"question_3":{"useDynamic":true},"question_4":{"useDynamic":true},"question_1":{"useDynamic":true},"question_2":{"useDynamic":true},"question_5":{"useDynamic":true}}},"dynamicMetadata":{"max":true,"flag_question_3":true,"flag_question_2":true,"flag_question_5":true,"min":true,"currentQuestionIndex":true,"flag_question_4":true,"flag_question_1":true,"question_3":true,"question_4":true,"question_1":true,"question_2":true,"operation":false,"question_5":true}},"63107da9-ea91-4c3c-b5df-d8303d240363":{"position":{"x":1905.6000000000001,"y":280},"conditionMetadata":[{"id":"17e2a1c2-0acb-4bce-a6cf-5fcfc37aa3e5","operator":{"name":"Equals","value":"Equals","shortDisplay":"="},"value":"false"}]},"56177ee5-4215-4449-a3e3-589d6d7add11":{"position":{"x":1449.6000000000001,"y":278.40000000000003},"parameters":{"Text":{"useDynamic":true}},"useDynamic":true,"conditionMetadata":[],"countryCodePrefix":"+1"},"da0ecb02-b835-4471-af5e-525686b26248":{"position":{"x":1912,"y":624.8000000000001}},"3e442c84-4cf0-412b-ad2c-627b9fde7c39":{"position":{"x":1676.8000000000002,"y":277.6},"parameters":{"LambdaFunctionARN":{"displayName":"${LambdaSurveyUtils}"},"LambdaInvocationAttributes":{"max":{"useDynamic":true},"flag_question_3":{"useDynamic":true},"input":{"useDynamic":true},"flag_question_2":{"useDynamic":true},"flag_question_5":{"useDynamic":true},"min":{"useDynamic":true},"currentQuestionIndex":{"useDynamic":true},"flag_question_4":{"useDynamic":true},"newCounter":{"useDynamic":true},"flag_question_1":{"useDynamic":true},"question_3":{"useDynamic":true},"question_4":{"useDynamic":true},"question_1":{"useDynamic":true},"question_2":{"useDynamic":true},"question_5":{"useDynamic":true}}},"dynamicMetadata":{"max":true,"flag_question_3":true,"input":true,"flag_question_2":true,"flag_question_5":true,"min":true,"currentQuestionIndex":true,"flag_question_4":true,"newCounter":true,"flag_question_1":true,"question_3":true,"question_4":true,"question_1":true,"question_2":true,"operation":false,"question_5":true}},"aa827bc2-ef0e-491a-b4b6-01122dda599d":{"position":{"x":1004.8000000000001,"y":280.8},"parameters":{"LoopCount":{"useDynamic":true}},"useDynamic":true},"c96fee53-310f-4d1f-8e88-859e2fad8ab5":{"position":{"x":1237.6000000000001,"y":844}},"48c2e006-db9f-4dab-b5bf-e8e81785fc49":{"position":{"x":888.8000000000001,"y":656},"parameters":{"Text":{"useDynamic":true}},"useDynamic":true},"74423203-603a-48f4-b84d-6fdc17e03c1d":{"position":{"x":600,"y":540},"parameters":{"LambdaFunctionARN":{"displayName":"${LambdaProcessSurveyFlagsConfig}"},"LambdaInvocationAttributes":{"flag_question_3":{"useDynamic":true},"flag_question_2":{"useDynamic":true},"flag_question_5":{"useDynamic":true},"flag_question_4":{"useDynamic":true},"flag_question_1":{"useDynamic":true}}},"dynamicMetadata":{"flag_question_3":true,"flag_question_2":true,"flag_question_5":true,"flag_question_4":true,"flag_question_1":true}},"3e6e1542-631c-4dd8-868e-15ae830f0255":{"position":{"x":600.8000000000001,"y":764},"parameters":{"LambdaFunctionARN":{"displayName":"${LambdaWriteSurveysResults}"}},"dynamicMetadata":{}}}},"Actions":[{"Parameters":{},"Identifier":"eda22bf3-c3f9-459f-8374-d56f84620644","Type":"DisconnectParticipant","Transitions":{}},{"Parameters":{"Text":"Invalid input."},"Identifier":"54b8b0f4-53b1-493a-9b74-e4056d92400e","Type":"MessageParticipant","Transitions":{"NextAction":"f669287d-527d-41b9-b6e3-ecdbc330755c"}},{"Parameters":{"Attributes":{"loopCounter":"$.External.currentQuestionIndex"}},"Identifier":"f669287d-527d-41b9-b6e3-ecdbc330755c","Type":"UpdateContactAttributes","Transitions":{"NextAction":"56177ee5-4215-4449-a3e3-589d6d7add11","Errors":[{"NextAction":"178a925b-dc1c-4d84-ab5f-84f50b5e8a2e","ErrorType":"NoMatchingError"}]}},{"Parameters":{"Attributes":{"survey_result_$.Attributes.loopCounter":"$.StoredCustomerInput"}},"Identifier":"8c223e1b-d94a-4b9c-acb5-3f400b030105","Type":"UpdateContactAttributes","Transitions":{"NextAction":"241f8a68-56ff-49a2-99ee-68625cd82310","Errors":[{"NextAction":"178a925b-dc1c-4d84-ab5f-84f50b5e8a2e","ErrorType":"NoMatchingError"}]}},{"Parameters":{},"Identifier":"178a925b-dc1c-4d84-ab5f-84f50b5e8a2e","Type":"DisconnectParticipant","Transitions":{}},{"Parameters":{"Attributes":{"loopCounter":"$.External.newCounter"}},"Identifier":"241f8a68-56ff-49a2-99ee-68625cd82310","Type":"UpdateContactAttributes","Transitions":{"NextAction":"aa827bc2-ef0e-491a-b4b6-01122dda599d","Errors":[{"NextAction":"178a925b-dc1c-4d84-ab5f-84f50b5e8a2e","ErrorType":"NoMatchingError"}]}},{"Parameters":{"Text":"$.Attributes.intro"},"Identifier":"3bb7ac4c-4ebf-4c6d-ab1f-fbdbdf8a0748","Type":"MessageParticipant","Transitions":{"NextAction":"aa827bc2-ef0e-491a-b4b6-01122dda599d","Errors":[{"NextAction":"aa827bc2-ef0e-491a-b4b6-01122dda599d","ErrorType":"NoMatchingError"}]}},{"Parameters":{"Text":"Sorry there was an unexpected error. We apologies for the inconvenience."},"Identifier":"e15e93de-3bae-47a8-ae59-d38b239849ce","Type":"MessageParticipant","Transitions":{"NextAction":"eda22bf3-c3f9-459f-8374-d56f84620644","Errors":[{"NextAction":"eda22bf3-c3f9-459f-8374-d56f84620644","ErrorType":"NoMatchingError"}]}},{"Parameters":{"Attributes":{"surveyId":"$.External.surveyId","intro":"$.External.introPrompt","surveySize":"$.External.surveySize","outro":"$.External.outroPrompt","loopCounter":"1"}},"Identifier":"ce7cd3b5-5eec-4d7f-802c-f1e8621baccd","Type":"UpdateContactAttributes","Transitions":{"NextAction":"3bb7ac4c-4ebf-4c6d-ab1f-fbdbdf8a0748","Errors":[{"NextAction":"e15e93de-3bae-47a8-ae59-d38b239849ce","ErrorType":"NoMatchingError"}]}},{"Parameters":{"Text":"Lambda getSurveyConfig error!"},"Identifier":"f1ec1587-371d-4b88-aeb0-cf92c3b10a3e","Type":"MessageParticipant","Transitions":{"NextAction":"eda22bf3-c3f9-459f-8374-d56f84620644"}},{"Parameters":{"FlowLoggingBehavior":"Enabled"},"Identifier":"4aa37d68-34fd-4cbf-af84-dd86cd97d758","Type":"UpdateFlowLoggingBehavior","Transitions":{"NextAction":"768119b4-b9c1-4f0d-85b0-3bb77958e1d0"}},{"Parameters":{"LambdaFunctionARN":"${LambdaGetSurveyConfig.Arn}","InvocationTimeLimitSeconds":"6","LambdaInvocationAttributes":{"surveyId":"$.Attributes.surveyId"}},"Identifier":"768119b4-b9c1-4f0d-85b0-3bb77958e1d0","Type":"InvokeLambdaFunction","Transitions":{"NextAction":"ce7cd3b5-5eec-4d7f-802c-f1e8621baccd","Errors":[{"NextAction":"f1ec1587-371d-4b88-aeb0-cf92c3b10a3e","ErrorType":"NoMatchingError"}]}},{"Parameters":{"LambdaFunctionARN":"${LambdaSurveyUtils.Arn}","InvocationTimeLimitSeconds":"5","LambdaInvocationAttributes":{"max":"$.External.max","flag_question_3":"$.External.flag_question_3","flag_question_2":"$.External.flag_question_2","flag_question_5":"$.External.flag_question_5","min":"$.External.min","currentQuestionIndex":"$.Attributes.loopCounter","flag_question_4":"$.External.flag_question_4","flag_question_1":"$.External.flag_question_1","question_3":"$.External.question_3","question_4":"$.External.question_4","question_1":"$.External.question_1","question_2":"$.External.question_2","operation":"getNextSurveyQuestion","question_5":"$.External.question_5"}},"Identifier":"224cfa54-c321-454b-8911-007386bd9fd3","Type":"InvokeLambdaFunction","Transitions":{"NextAction":"56177ee5-4215-4449-a3e3-589d6d7add11","Errors":[{"NextAction":"da0ecb02-b835-4471-af5e-525686b26248","ErrorType":"NoMatchingError"}]}},{"Parameters":{"ComparisonValue":"$.External.validInput"},"Identifier":"63107da9-ea91-4c3c-b5df-d8303d240363","Type":"Compare","Transitions":{"NextAction":"8c223e1b-d94a-4b9c-acb5-3f400b030105","Conditions":[{"NextAction":"54b8b0f4-53b1-493a-9b74-e4056d92400e","Condition":{"Operator":"Equals","Operands":["false"]}}],"Errors":[{"NextAction":"8c223e1b-d94a-4b9c-acb5-3f400b030105","ErrorType":"NoMatchingCondition"}]}},{"Parameters":{"StoreInput":"True","InputTimeLimitSeconds":"5","Text":"$.External.nextQuestion","DTMFConfiguration":{"DisableCancelKey":"False"},"InputValidation":{"CustomValidation":{"MaximumLength":"1"}}},"Identifier":"56177ee5-4215-4449-a3e3-589d6d7add11","Type":"GetParticipantInput","Transitions":{"NextAction":"3e442c84-4cf0-412b-ad2c-627b9fde7c39","Errors":[{"NextAction":"da0ecb02-b835-4471-af5e-525686b26248","ErrorType":"NoMatchingError"}]}},{"Parameters":{},"Identifier":"da0ecb02-b835-4471-af5e-525686b26248","Type":"DisconnectParticipant","Transitions":{}},{"Parameters":{"LambdaFunctionARN":"${LambdaSurveyUtils.Arn}","InvocationTimeLimitSeconds":"5","LambdaInvocationAttributes":{"max":"$.External.max","flag_question_3":"$.External.flag_question_3","input":"$.StoredCustomerInput","flag_question_2":"$.External.flag_question_2","flag_question_5":"$.External.flag_question_5","min":"$.External.min","currentQuestionIndex":"$.External.currentQuestionIndex","flag_question_4":"$.External.flag_question_4","newCounter":"$.External.newCounter","flag_question_1":"$.External.flag_question_1","question_3":"$.External.question_3","question_4":"$.External.question_4","question_1":"$.External.question_1","question_2":"$.External.question_2","operation":"validateInput","question_5":"$.External.question_5"}},"Identifier":"3e442c84-4cf0-412b-ad2c-627b9fde7c39","Type":"InvokeLambdaFunction","Transitions":{"NextAction":"63107da9-ea91-4c3c-b5df-d8303d240363","Errors":[{"NextAction":"da0ecb02-b835-4471-af5e-525686b26248","ErrorType":"NoMatchingError"}]}},{"Parameters":{"LoopCount":"$.Attributes.surveySize"},"Identifier":"aa827bc2-ef0e-491a-b4b6-01122dda599d","Type":"Loop","Transitions":{"NextAction":"74423203-603a-48f4-b84d-6fdc17e03c1d","Conditions":[{"NextAction":"224cfa54-c321-454b-8911-007386bd9fd3","Condition":{"Operator":"Equals","Operands":["ContinueLooping"]}},{"NextAction":"74423203-603a-48f4-b84d-6fdc17e03c1d","Condition":{"Operator":"Equals","Operands":["DoneLooping"]}}]}},{"Parameters":{},"Identifier":"c96fee53-310f-4d1f-8e88-859e2fad8ab5","Type":"DisconnectParticipant","Transitions":{}},{"Parameters":{"Text":"$.Attributes.outro"},"Identifier":"48c2e006-db9f-4dab-b5bf-e8e81785fc49","Type":"MessageParticipant","Transitions":{"NextAction":"c96fee53-310f-4d1f-8e88-859e2fad8ab5","Errors":[{"NextAction":"c96fee53-310f-4d1f-8e88-859e2fad8ab5","ErrorType":"NoMatchingError"}]}},{"Parameters":{"LambdaFunctionARN":"${LambdaProcessSurveyFlagsConfig.Arn}","InvocationTimeLimitSeconds":"5","LambdaInvocationAttributes":{"flag_question_3":"$.External.flag_question_3","flag_question_2":"$.External.flag_question_2","flag_question_5":"$.External.flag_question_5","flag_question_4":"$.External.flag_question_4","flag_question_1":"$.External.flag_question_1"}},"Identifier":"74423203-603a-48f4-b84d-6fdc17e03c1d","Type":"InvokeLambdaFunction","Transitions":{"NextAction":"3e6e1542-631c-4dd8-868e-15ae830f0255","Errors":[{"NextAction":"3e6e1542-631c-4dd8-868e-15ae830f0255","ErrorType":"NoMatchingError"}]}},{"Parameters":{"LambdaFunctionARN":"${LambdaWriteSurveysResults.Arn}","InvocationTimeLimitSeconds":"5"},"Identifier":"3e6e1542-631c-4dd8-868e-15ae830f0255","Type":"InvokeLambdaFunction","Transitions":{"NextAction":"48c2e006-db9f-4dab-b5bf-e8e81785fc49","Errors":[{"NextAction":"c96fee53-310f-4d1f-8e88-859e2fad8ab5","ErrorType":"NoMatchingError"}]}}],"Settings":{"InputParameters":[],"OutputParameters":[],"Transitions":[]}}'
+            InstanceArn: !Ref AmazonConnectInstanceARN
+            Name: "Contact Survey"
+            State: ACTIVE
+
+Outputs:
+    WebClient:
+        Description: "The frontend access URL"
+        Value: !GetAtt CloudFrontDistribution.DomainName
+    AdminUser:
+        Description: "The initial admin user for the frontend"
+        Value: !Ref UserPoolUser

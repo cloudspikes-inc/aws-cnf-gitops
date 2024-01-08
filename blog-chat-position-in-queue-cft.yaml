@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cloudformation for Chat Position In Queue Blog Post
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Amazon Connect Resource Information"
+        Parameters:
+          - ConnectInstanceId
+          - BasicQueueArn
+          - SampleDisconnectFlowArn
+    ParameterLabels: 
+      ConnectInstanceId: 
+        default: "Amazon Connect Instance Id to be used"
+      BasicQueueArn: 
+        default: "ARN of the BasicQueue in your Amazon Connect Instance"
+      SampleDisconnectFlowArn: 
+        default: "ARN of the Sample Disconnect Flow in your Amazon Connect Instance"
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: Enter the Amazon Connect Instance Id
+  BasicQueueArn:
+    Type: String
+    Description: Enter the Amazon Connect Basic Queue Arn
+  SampleDisconnectFlowArn:
+    Type: String
+    Description: Enter the Amazon Connect Sample Disconnect Flow Arn
+
+
+Resources:
+  PositionInQueueDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Join
+                  - ''
+                  - - !Ref AWS::StackName
+                    - '-ChatPositionInQueueDB'
+      AttributeDefinitions:
+        - AttributeName: ID
+          AttributeType: S
+      KeySchema: 
+        - AttributeName: ID
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST       
+  
+  ChatPositionInQueueFnRole:
+    DependsOn: PositionInQueueDB
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join
+                  - ''
+                  - - !Ref AWS::StackName
+                    - '-ChatPositionInQueueFnRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17       
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DynamoDBManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Managed Policy to attach to ChatPositionInQueueFnRole 
+      ManagedPolicyName: !Join
+                          - ''
+                          - - !Ref AWS::StackName
+                            - '-DynamoDBAccessPolicyForLambda'
+      Path: /
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'dynamodb:BatchGetItem'
+              - 'dynamodb:BatchWriteItem'
+              - 'dynamodb:PutItem'
+              - 'dynamodb:DeleteItem'
+              - 'dynamodb:Scan'
+              - 'dynamodb:Query'
+              - 'dynamodb:UpdateItem'  
+              - 'dynamodb:GetItem'   
+              - 'dynamodb:UpdateTable'
+            Resource: !GetAtt PositionInQueueDB.Arn
+      Roles: 
+        - !Ref ChatPositionInQueueFnRole        
+
+  ConnectManagerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties: 
+      Description: Managed Policy to attach to ChatPositionInQueueFnRole 
+      ManagedPolicyName: !Join
+                          - ''
+                          - - !Ref AWS::StackName
+                            - '-ConnectAccessForLambda'
+      Path: /
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'connect:GetCurrentMetricData'
+              - 'connect:ListQueues'
+            Resource: !Join
+                      - ''
+                      - - 'arn:aws:connect:'
+                        - !Ref AWS::Region 
+                        - ':'
+                        - !Ref AWS::AccountId
+                        - ':instance/'
+                        - !Ref ConnectInstanceId
+                        - '/*'
+      Roles: 
+        - !Ref ChatPositionInQueueFnRole         
+
+  ChatPositionInQueueLambdaFunction:
+    DependsOn: ChatPositionInQueueFnRole
+    Type: AWS::Lambda::Function 
+    Properties:
+      FunctionName: !Join
+                    - ''
+                    - - !Ref AWS::StackName
+                      - '-ChatPositionInQueueLambda'
+      Description: Adds deletes and maintains customer contact id in DynamoDB
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Role: !GetAtt ChatPositionInQueueFnRole.Arn
+      MemorySize: 4096
+      Timeout: 60
+      Environment:
+        Variables:
+          CONNECTINSTANCEID: !Ref "ConnectInstanceId" 
+          POSINQUEUEDDB: !Ref PositionInQueueDB
+          WATCHDOGTHRESHOLD: "105000"
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const connect = new AWS.Connect();
+          const connectInstanceID = process.env.CONNECTINSTANCEID;
+          const posInQueueDDBTable = process.env.POSINQUEUEDDB;
+
+          exports.handler = async(event) => {
+              console.log('Event received:', JSON.stringify(event));
+              try {
+                  const operation = !event.Details?.Parameters.operation ?
+                      !event.Parameters?.operation ? 'invalid event' : event.Parameters.operation :
+                      event.Details.Parameters.operation;
+
+                  switch (operation) {
+                      case "add":
+                          const positionInQueue = await addRecord(event);
+                          console.log('Contact addition complete');
+                          return { positionInQueue: positionInQueue };
+                      case "delete":
+                          await deleteRecord(event);
+                          console.log('Contact deletion complete');
+                          return;
+                      case "maintain":
+                          const queueList = await getConnectQueueList(connectInstanceID);
+                          if (queueList.length === 0) {
+                              console.log('No Queue to process');
+                          }
+                          else {
+                              for (let i = 0; i < queueList.QueueSummaryList.length; i++) {
+                                  await maintainBaseContactID(queueList.QueueSummaryList[i].Name, queueList.QueueSummaryList[i].Arn);
+                              }
+                              await maintainPosInQRecords(event, queueList.QueueSummaryList);
+                          }
+                          console.log("End of Maintainence");
+                          return;
+                      default:
+                          throw new Error(`Invalid operation: ${operation}`);
+                  }
+
+              }
+              catch (err) {
+                  console.error(err);
+                  throw err;
+              }
+          };
+
+          async function addRecord(event) {
+              const contactId = event.Details.ContactData.ContactId;
+              const queueName = event.Details.ContactData.Queue.Name;
+
+              const getRecordForContactIdParams = {
+                  TableName: posInQueueDDBTable,
+                  KeyConditionExpression: "ID = :varContactId",
+                  ExpressionAttributeValues: {
+                      ":varContactId": { S: contactId }
+                  },
+              };
+
+              const dynamodb = new AWS.DynamoDB();
+              const getRecordForContactIdResult = await dynamodb.query(getRecordForContactIdParams).promise();
+
+              const currentTime = Math.floor(new Date()).toString();
+              let positionInQueue = null;
+              if (getRecordForContactIdResult.Items.length == 0) {
+                  /*Get total customers in queue since this customer will be added to the end
+                          Total customers is contained in base ID = Queue Name (Eg: BasicQueue) */
+
+                  console.log('ContactID does not exist, Adding it');
+
+                  const getRecordForBaseIDParams = {
+                      TableName: posInQueueDDBTable,
+                      KeyConditionExpression: "ID = :varContactId",
+                      ExpressionAttributeValues: {
+                          ":varContactId": { S: queueName.toString() }
+                      }
+                  };
+
+                  const getRecordForBaseIdResult = await dynamodb.query(getRecordForBaseIDParams).promise();
+                  if (getRecordForBaseIdResult.Items.length === 0) {
+                      throw new Error("No details for Base ID's found, please enable the cloudwatch event to run the maintain function first before adding any contact id's");
+                  }
+                  const totalCustomersInQueue = getRecordForBaseIdResult.Items[0].PositionInQueue.S;
+
+                  const dbInsertParams = {
+                      TableName: posInQueueDDBTable,
+                      Item: {
+                          'ID': { S: contactId },
+                          'TimePlacedInQueueEpoch': { S: currentTime.toString() },
+                          'PositionInQueue': { S: totalCustomersInQueue.toString() },
+                          'IDType': { S: 'ContactID' },
+                          'QueueName': { S: queueName.toString() },
+                          'WatchDogTime': { S: currentTime.toString() }
+                      },
+                  };
+
+                  console.log('Inserting into DDB: ', dbInsertParams);
+                  await dynamodb.putItem(dbInsertParams).promise();
+
+                  positionInQueue = totalCustomersInQueue;
+
+              }
+              else {
+                  console.log('ContactID does exist, updating it');
+
+                  // update the watchdog for the ContactID
+                  const updateWatchDogTimerParams = {
+                      TableName: posInQueueDDBTable,
+                      Key: {
+                          "ID": { S: contactId }
+                      },
+                      UpdateExpression: "set WatchDogTime = :updatedWatchDogTimer",
+                      ExpressionAttributeValues: {
+                          ":updatedWatchDogTimer": { S: currentTime }
+                      },
+                      ReturnValues: "UPDATED_NEW"
+                  };
+                  await dynamodb.updateItem(updateWatchDogTimerParams).promise();
+
+                  positionInQueue = getRecordForContactIdResult.Items[0].PositionInQueue.S;
+              }
+
+              return positionInQueue;
+          }
+
+          async function deleteRecord(event) {
+              const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+              var deleteParams = {
+                  TableName: posInQueueDDBTable,
+                  Key: {
+                      "ID": event.Details.ContactData.ContactId
+                  },
+              };
+              await dynamodb.delete(deleteParams).promise();
+          }
+
+          async function maintainBaseContactID(queueName, queueArn) {
+              // 0 is replaced by the Queue Name in ContactID to maintain the updated contact count in DB
+              const maintainQueueArn = queueArn;
+              const maintainQueueName = queueName;
+
+
+              const ddbQueryParams = {
+                  TableName: posInQueueDDBTable,
+                  KeyConditionExpression: "ID = :sContactId",
+                  ExpressionAttributeValues: {
+                      ":sContactId": { S: maintainQueueName } // Getting the Base Contact ID. Base Contact ID has the Queue Name instead of the value 0.
+                  },
+              };
+
+              const dynamodb = new AWS.DynamoDB();
+              const queryResult = await dynamodb.query(ddbQueryParams).promise();
+
+
+              const currentTime = Math.floor(new Date()).toString();
+              const contactsInQueue = await getContactsInQueue(maintainQueueArn, maintainQueueName);
+
+              const updateParams = {
+                  TableName: posInQueueDDBTable,
+                  Key: {
+                      "ID": { S: maintainQueueName },
+                  },
+                  UpdateExpression: "set PositionInQueue = :contactsInQueue, TimePlacedInQueueEpoch = :timePlaced, IDType = :type", //, QueueArn = :queueArn",
+                  ExpressionAttributeValues: {
+                      ":contactsInQueue": { S: contactsInQueue.toString() },
+                      ":timePlaced": { S: currentTime.toString() },
+                      ":type": { S: "Queue" }
+                      // ":queueArn": { S: maintainQueueArn.toString() }
+                  },
+                  ReturnValues: "UPDATED_NEW"
+              };
+              //Updating Base ContactID
+              await dynamodb.updateItem(updateParams).promise();
+          }
+
+          async function maintainPosInQRecords(event, queueList) {
+
+              const dynamodb = new AWS.DynamoDB();
+              let scannedDbItems = [];
+
+
+              const scanParams = {
+                  TableName: posInQueueDDBTable,
+              };
+
+              while (true) {
+                  const scanResult = await dynamodb.scan(scanParams).promise();
+                  scannedDbItems = scannedDbItems.concat(scanResult.Items);
+
+                  if (typeof scanResult.LastEvaluatedKey != "undefined") {
+                      scanParams.ExclusiveStartKey = scanResult.LastEvaluatedKey;
+                  }
+                  else {
+                      break;
+                  }
+              }
+
+              const positionInQueueMap = {};
+              const currentTime = Math.floor(new Date());
+              const watchdogThresholdMS = process.env.WATCHDOGTHRESHOLD;
+              const abandonedCallSet = new Array();
+
+              for (let i = 0; i < scannedDbItems.length; i++) {
+                  const idType = scannedDbItems[i].IDType.S;
+
+                  if (idType === 'ContactID') {
+                      const queue = scannedDbItems[i].QueueName.S;
+
+                      const watchdogElaspedTime = currentTime - scannedDbItems[i].WatchDogTime.S;
+
+                      if (watchdogElaspedTime > watchdogThresholdMS) {
+                          abandonedCallSet.push(scannedDbItems[i]);
+                      }
+                      else {
+                          if (queue in positionInQueueMap) {
+                              positionInQueueMap[queue].push(scannedDbItems[i]);
+                          }
+                          else {
+                              positionInQueueMap[queue] = [scannedDbItems[i]];
+                          }
+                      }
+                  }
+              }
+
+              for (const [key, value] of Object.entries(positionInQueueMap)) {
+                  value.sort(function(a, b) { return a.TimePlacedInQueueEpoch.S - b.TimePlacedInQueueEpoch.S });
+              }
+
+              for (const [key, value] of Object.entries(positionInQueueMap)) {
+                  for (let pos = 0; pos < value.length; pos++) {
+                      const scannedItem = value[pos];
+                      // console.log(`DDB update: ${key}, ${value[pos]}, ${pos}`);
+                      const updatePosParams = {
+                          TableName: posInQueueDDBTable,
+                          Key: {
+                              "ID": { S: scannedItem.ID.S.toString() }
+                          },
+                          UpdateExpression: "set PositionInQueue = :contactPosInQueue",
+                          ExpressionAttributeValues: {
+                              ":contactPosInQueue": { S: pos.toString() },
+                          },
+                          ReturnValues: "UPDATED_NEW"
+                      };
+
+                      await dynamodb.updateItem(updatePosParams).promise();
+                  }
+              }
+
+              if (abandonedCallSet.length > 0) {
+                  for (let i = 0; i < abandonedCallSet.length; i++) {
+                      const params = {
+                          TableName: posInQueueDDBTable,
+                          Key: {
+                              "ID": { S: abandonedCallSet[i].ID.S.toString() },
+                          },
+                      };
+                      await dynamodb.deleteItem(params).promise();
+                  }
+              }
+          }
+
+          async function getConnectQueueList(connectInstanceID) {
+
+              const params = {
+                  InstanceId: connectInstanceID,
+                  QueueTypes: ['STANDARD']
+              }
+
+              const queueList = await connect.listQueues(params).promise();
+              return queueList;
+          }
+
+          async function getContactsInQueue(queueArn, queueName) {
+              const currentMetricsParams = {
+                  CurrentMetrics: [ /* required */
+                      { Name: 'CONTACTS_IN_QUEUE', Unit: 'COUNT' },
+                  ],
+                  Filters: { /* required */
+                      Channels: ['CHAT'],
+                      Queues: [queueArn],
+                  },
+                  InstanceId: connectInstanceID,
+                  /* required */
+                  Groupings: ['QUEUE'],
+                  MaxResults: 1,
+                  NextToken: null,
+              };
+
+              let contactsInQueueCount = null;
+
+              const queueMetrics = await connect.getCurrentMetricData(currentMetricsParams).promise();
+              if (queueMetrics.MetricResults.length === 0) {
+                  contactsInQueueCount = '0';
+              }
+              else {
+                  contactsInQueueCount = queueMetrics.MetricResults[0].Collections.find(contactsInQueueCount => contactsInQueueCount.Metric.Name === 'CONTACTS_IN_QUEUE').Value;
+              }
+
+              return contactsInQueueCount.toString();
+          }
+
+  ChatPositionInQueueEventRule:
+    DependsOn: ChatPositionInQueueLambdaFunction
+    Type: "AWS::Events::Rule"
+    Properties:
+        Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueEventRule'
+        Description: "Position in Queue cloudwatch rule"
+        ScheduleExpression: "rate(1 minute)"
+        State: "ENABLED"
+        Targets: 
+          - 
+            Arn: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+            Id: "Id2889402329267"
+            Input: "{     \"Parameters\": {       \"operation\": \"maintain\"     } }"
+        EventBusName: "default"
+
+  EventsInvokeLambdaFnPermission: 
+    DependsOn: ChatPositionInQueueEventRule
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref ChatPositionInQueueLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ChatPositionInQueueEventRule.Arn
+
+  ConnectInvokeLambdaFnPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChatPositionInQueueLambdaFunction
+      Principal: connect.amazonaws.com
+      SourceArn: !Join
+                - ''
+                - - 'arn:aws:connect:'
+                  - !Ref AWS::Region 
+                  - ':'
+                  - !Ref AWS::AccountId
+                  - ':instance/'
+                  - !Ref ConnectInstanceId
+
+  PositionInQueueChatFlow:
+    DependsOn: 
+    - PositionInQueueCustomerQueueAddRecordFlow
+    - PositionInQueueCustomerWhisperRemoveRecordFlow
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueChat'
+      Description: Position In Queue Inbound Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"3dc68fd7-60dd-4318-b0f7-420931062b05\",\"Metadata\":{\"entryPointPosition\":{\"x\":20,\"y\":20},\"ActionMetadata\":{\"3dc68fd7-60dd-4318-b0f7-420931062b05\":{\"position\":{\"x\":164,\"y\":20}},\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\":{\"position\":{\"x\":406.40000000000003,\"y\":285.6}},\"2db78269-2720-41b1-8928-5a5684d7788f\":{\"position\":{\"x\":154.4,\"y\":247.20000000000002}},\"58ae6259-87a7-41fd-84ed-4c524847cbcc\":{\"position\":{\"x\":1250.4,\"y\":14.4},\"parameters\":{\"QueueId\":{\"displayName\":\"BasicQueue\"}},\"queue\":{\"text\":\"BasicQueue\"}},\"890318c8-591c-4175-b93e-7abc17cba9de\":{\"position\":{\"x\":382.40000000000003,\"y\":20.8},\"overrideConsoleVoice\":false},\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\":{\"position\":{\"x\":1032.8,\"y\":14.4},\"parameters\":{\"EventHooks\":{\"CustomerWhisper\":{\"displayName\":\"PositionInQueueCustomerWhisperRemoveRecordFlowName\"}}},\"contactFlow\":{\"text\":\"PositionInQueueCustomerWhisperRemoveRecord\",\"id\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"},\"customerOrAgent\":true},\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\":{\"position\":{\"x\":1478.4,\"y\":-66.4}},\"95df56f1-b9c3-484d-9d26-6751a3059780\":{\"position\":{\"x\":602.4,\"y\":20},\"parameters\":{\"EventHooks\":{\"CustomerRemaining\":{\"displayName\":\"Sample disconnect flow\"}}},\"contactFlow\":{\"text\":\"Sample disconnect flow\",\"id\":\"${SampleDisconnectFlowArn}\"}},\"1c63f47a-f21b-4760-aaef-50e61da90f52\":{\"position\":{\"x\":820.8000000000001,\"y\":18.400000000000002},\"parameters\":{\"EventHooks\":{\"CustomerQueue\":{\"displayName\":\"PositionInQueueCustomerQueueAddRecord\"}}},\"contactFlow\":{\"text\":\"PositionInQueueCustomerQueueAddRecord\",\"id\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"},\"customerOrAgent\":true}}},\"Actions\":[{\"Parameters\":{\"FlowLoggingBehavior\":\"Enabled\"},\"Identifier\":\"3dc68fd7-60dd-4318-b0f7-420931062b05\",\"Type\":\"UpdateFlowLoggingBehavior\",\"Transitions\":{\"NextAction\":\"890318c8-591c-4175-b93e-7abc17cba9de\"}},{\"Parameters\":{},\"Identifier\":\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\",\"Type\":\"TransferContactToQueue\",\"Transitions\":{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"QueueAtCapacity\"},{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"Hi, Welcome to Chat Position In Queue Blog.\"},\"Identifier\":\"2db78269-2720-41b1-8928-5a5684d7788f\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"4c6a88e1-ecdb-406e-b19a-8e89b0cc0c59\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"QueueId\":\"${BasicQueueArn}\"},\"Identifier\":\"58ae6259-87a7-41fd-84ed-4c524847cbcc\",\"Type\":\"UpdateContactTargetQueue\",\"Transitions\":{\"NextAction\":\"2db78269-2720-41b1-8928-5a5684d7788f\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"TextToSpeechVoice\":\"Joanna\"},\"Identifier\":\"890318c8-591c-4175-b93e-7abc17cba9de\",\"Type\":\"UpdateContactTextToSpeechVoice\",\"Transitions\":{\"NextAction\":\"95df56f1-b9c3-484d-9d26-6751a3059780\"}},{\"Parameters\":{\"EventHooks\":{\"CustomerWhisper\":\"${PositionInQueueCustomerWhisperRemoveRecordFlow}\"}},\"Identifier\":\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"58ae6259-87a7-41fd-84ed-4c524847cbcc\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{},\"Identifier\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"Type\":\"DisconnectParticipant\",\"Transitions\":{}},{\"Parameters\":{\"EventHooks\":{\"CustomerRemaining\":\"${SampleDisconnectFlowArn}\"}},\"Identifier\":\"95df56f1-b9c3-484d-9d26-6751a3059780\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"1c63f47a-f21b-4760-aaef-50e61da90f52\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"EventHooks\":{\"CustomerQueue\":\"${PositionInQueueCustomerQueueAddRecordFlow}\"}},\"Identifier\":\"1c63f47a-f21b-4760-aaef-50e61da90f52\",\"Type\":\"UpdateContactEventHooks\",\"Transitions\":{\"NextAction\":\"b2de5af4-1dd5-4a71-a1be-109bde93d04f\",\"Errors\":[{\"NextAction\":\"2badefc0-ae32-4707-9080-59bdc0fd2ae3\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - PositionInQueueCustomerQueueAddRecordFlow: !GetAtt PositionInQueueCustomerQueueAddRecordFlow.ContactFlowArn
+          PositionInQueueCustomerWhisperRemoveRecordFlow: !GetAtt PositionInQueueCustomerWhisperRemoveRecordFlow.ContactFlowArn
+          BasicQueueArn: !Ref BasicQueueArn
+          SampleDisconnectFlowArn: !Ref SampleDisconnectFlowArn
+
+      State: ACTIVE
+      Type: CONTACT_FLOW
+
+  PositionInQueueCustomerQueueAddRecordFlow:
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueCustomerQueueAddRecord'
+      Description: Position In Queue Customer Queue Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\",\"Metadata\":{\"entryPointPosition\":{\"x\":-67.2,\"y\":54.400000000000006},\"ActionMetadata\":{\"438a9be3-850b-4a4d-b90b-6c3499683fce\":{\"position\":{\"x\":1040.8,\"y\":91.2},\"conditionMetadata\":[{\"id\":\"619a8a5a-1a9d-4284-9daa-daa617056665\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"0\"},{\"id\":\"bfd3ffec-16ec-49c9-af6a-59fc0a1a91d0\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"1\"}]},\"01cf08c9-5293-448d-b74b-987a9db1fa3d\":{\"position\":{\"x\":789.6,\"y\":89.60000000000001},\"dynamicParams\":[]},\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\":{\"position\":{\"x\":1288,\"y\":89.60000000000001}},\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\":{\"position\":{\"x\":1295.2,\"y\":281.6}},\"4e39f4f5-072d-49a3-859c-a456ea518560\":{\"position\":{\"x\":1295.2,\"y\":478.40000000000003}},\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\":{\"position\":{\"x\":798.4000000000001,\"y\":-96},\"dynamicParams\":[]},\"ceefc394-319b-49e0-bdec-da0007a0d20c\":{\"position\":{\"x\":1289.6000000000001,\"y\":-106.4}},\"f542437b-05eb-45c5-bf64-1612688ef82c\":{\"position\":{\"x\":552,\"y\":-20},\"conditionMetadata\":[{\"id\":\"ff29df42-66c7-4595-aa93-9326ba565a87\",\"operator\":{\"name\":\"Equals\",\"value\":\"Equals\",\"shortDisplay\":\"=\"},\"value\":\"True\"}]},\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\":{\"position\":{\"x\":60,\"y\":36.800000000000004},\"dynamicParams\":[]},\"ed12a7df-a29a-44f4-8d86-b0721848d663\":{\"position\":{\"x\":1558.4,\"y\":35.2},\"parameters\":{\"TimeLimitSeconds\":{\"unit\":1}},\"timeoutUnit\":{\"display\":\"Seconds\",\"value\":\"second\"}},\"68c64852-a34f-444a-82f2-de2c58d50e1b\":{\"position\":{\"x\":1804,\"y\":-212}},\"51463702-9093-4037-8dd8-3ce3ab54da5e\":{\"position\":{\"x\":312,\"y\":-8},\"parameters\":{\"LambdaFunctionARN\":{\"displayName\":\"${LambdaFunctionDisplayname}\"}},\"dynamicMetadata\":{\"operation\":false}}}},\"Actions\":[{\"Parameters\":{\"ComparisonValue\":\"$.Attributes.customerPosition\"},\"Identifier\":\"438a9be3-850b-4a4d-b90b-6c3499683fce\",\"Type\":\"Compare\",\"Transitions\":{\"NextAction\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"Conditions\":[{\"NextAction\":\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"0\"]}},{\"NextAction\":\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"1\"]}}],\"Errors\":[{\"NextAction\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"ErrorType\":\"NoMatchingCondition\"}]}},{\"Parameters\":{\"Attributes\":{\"customerPosition\":\"$.External.positionInQueue \"}},\"Identifier\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"438a9be3-850b-4a4d-b90b-6c3499683fce\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are next\"},\"Identifier\":\"fc7c2cbe-da5a-486a-9f9b-4999cd077aa6\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are behind 1 customer in the queue\"},\"Identifier\":\"af726e2d-af6e-4adf-87b7-27a1b19cddfc\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You are behind $.Attributes.customerPosition customers in the queue\"},\"Identifier\":\"4e39f4f5-072d-49a3-859c-a456ea518560\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Attributes\":{\"firstTime\":\"False\"}},\"Identifier\":\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"ceefc394-319b-49e0-bdec-da0007a0d20c\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"Text\":\"You've been added to the queue\"},\"Identifier\":\"ceefc394-319b-49e0-bdec-da0007a0d20c\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"ComparisonValue\":\"$.Attributes.firstTime\"},\"Identifier\":\"f542437b-05eb-45c5-bf64-1612688ef82c\",\"Type\":\"Compare\",\"Transitions\":{\"NextAction\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"Conditions\":[{\"NextAction\":\"d8a7ddfb-9ee7-40c7-8ec6-b17f7bb8623c\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"True\"]}}],\"Errors\":[{\"NextAction\":\"01cf08c9-5293-448d-b74b-987a9db1fa3d\",\"ErrorType\":\"NoMatchingCondition\"}]}},{\"Parameters\":{\"Attributes\":{\"firstTime\":\"True\"}},\"Identifier\":\"e7d0bc8b-5c72-4ce4-b99c-a28d392c2553\",\"Type\":\"UpdateContactAttributes\",\"Transitions\":{\"NextAction\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{\"TimeLimitSeconds\":\"70\"},\"Identifier\":\"ed12a7df-a29a-44f4-8d86-b0721848d663\",\"Type\":\"Wait\",\"Transitions\":{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"Conditions\":[{\"NextAction\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Condition\":{\"Operator\":\"Equals\",\"Operands\":[\"WaitCompleted\"]}}],\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}},{\"Parameters\":{},\"Identifier\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"Type\":\"DisconnectParticipant\",\"Transitions\":{}},{\"Parameters\":{\"LambdaFunctionARN\":\"${ChatPositionInQueueLambdaFunction}\",\"InvocationTimeLimitSeconds\":\"3\",\"LambdaInvocationAttributes\":{\"operation\":\"add\"}},\"Identifier\":\"51463702-9093-4037-8dd8-3ce3ab54da5e\",\"Type\":\"InvokeLambdaFunction\",\"Transitions\":{\"NextAction\":\"f542437b-05eb-45c5-bf64-1612688ef82c\",\"Errors\":[{\"NextAction\":\"68c64852-a34f-444a-82f2-de2c58d50e1b\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - ChatPositionInQueueLambdaFunction: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+          LambdaFunctionDisplayname: !Ref ChatPositionInQueueLambdaFunction
+      State: ACTIVE
+      Type: CUSTOMER_QUEUE
+
+  PositionInQueueCustomerWhisperRemoveRecordFlow:
+    Type: 'AWS::Connect::ContactFlow'
+    Properties:
+      Name: !Join
+              - ''
+              - - !Ref AWS::StackName
+                - '-PositionInQueueCustomerWhisperRemoveRecord'
+      Description: Position In Queue Customer Whisper Flow
+      InstanceArn:
+        !Join
+          - ''
+          - - 'arn:aws:connect:'
+            - !Ref AWS::Region
+            - ':'
+            - !Ref AWS::AccountId
+            - ':'
+            - 'instance/'
+            - !Ref ConnectInstanceId
+      Type: CONTACT_FLOW
+      Content: !Sub
+        - "{\"Version\":\"2019-10-30\",\"StartAction\":\"80b95625-f54c-4fbc-8b3c-508c30982122\",\"Metadata\":{\"entryPointPosition\":{\"x\":14.4,\"y\":13.600000000000001},\"ActionMetadata\":{\"aec45209-5e30-42f5-bf80-a22e222cf946\":{\"position\":{\"x\":804,\"y\":156}},\"80b95625-f54c-4fbc-8b3c-508c30982122\":{\"position\":{\"x\":245.60000000000002,\"y\":84.80000000000001}},\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\":{\"position\":{\"x\":498.40000000000003,\"y\":88},\"parameters\":{\"LambdaFunctionARN\":{\"displayName\":\"${LambdaFunctionDisplayname}\"}},\"dynamicMetadata\":{\"operation\":false}}}},\"Actions\":[{\"Parameters\":{},\"Identifier\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"Type\":\"EndFlowExecution\",\"Transitions\":{}},{\"Parameters\":{\"Text\":\"You are now being connected to an agent\"},\"Identifier\":\"80b95625-f54c-4fbc-8b3c-508c30982122\",\"Type\":\"MessageParticipant\",\"Transitions\":{\"NextAction\":\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\"}},{\"Parameters\":{\"LambdaFunctionARN\":\"${ChatPositionInQueueLambdaFunction}\",\"InvocationTimeLimitSeconds\":\"3\",\"LambdaInvocationAttributes\":{\"operation\":\"delete\"}},\"Identifier\":\"d9aea9e2-a8e4-4ca6-a288-476bccfcf5b0\",\"Type\":\"InvokeLambdaFunction\",\"Transitions\":{\"NextAction\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"Errors\":[{\"NextAction\":\"aec45209-5e30-42f5-bf80-a22e222cf946\",\"ErrorType\":\"NoMatchingError\"}]}}]}"
+        - ChatPositionInQueueLambdaFunction: !GetAtt ChatPositionInQueueLambdaFunction.Arn
+          LambdaFunctionDisplayname: !Ref ChatPositionInQueueLambdaFunction
+      State: ACTIVE
+      Type: CUSTOMER_WHISPER
+
